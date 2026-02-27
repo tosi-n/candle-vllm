@@ -1,7 +1,6 @@
 use super::DefaultPipeline;
 #[cfg(feature = "nccl")]
 use crate::openai::communicator::{DaemonManager, MessageType, TaskSampleData};
-#[cfg(feature = "nccl")]
 use crate::openai::pipelines::TokenOrFinishReason;
 use crate::openai::streaming::ChatResponse;
 use crate::openai::TaskData;
@@ -268,6 +267,7 @@ impl LLMEngine {
                             task.is_embedding,
                             task.encoding_format,
                             task.embedding_type,
+                            task.adapter_id.clone(),
                             None,
                         );
                         tracing::debug!("Daemon process: add_sequence to group {}", task.group_id);
@@ -311,6 +311,7 @@ impl LLMEngine {
                     task.is_embedding,
                     task.encoding_format.clone(),
                     task.embedding_type.clone(),
+                    task.adapter_id.clone(),
                     sender,
                 );
                 tracing::debug!("Main process: add_sequence to group {}", task.group_id);
@@ -509,7 +510,7 @@ impl LLMEngine {
                 };
             };
 
-            let mut scheduled: VecDeque<Arc<SequenceGroup>> = {
+            let scheduled: VecDeque<Arc<SequenceGroup>> = {
                 let e = engine.read();
                 let x = e.sequence_groups.read();
                 x.clone()
@@ -518,137 +519,20 @@ impl LLMEngine {
                 continue; //data not ready
             }
 
-            let seqs = scheduled[0].get_seqs();
             let is_embedding = scheduled[0].is_embedding;
-            //run partial models in parallel
-            let (mut logits, is_prompt, model_name) = {
-                let e = engine.read();
-                let (pipeline, cache_engine) = e.get_pipeline(rank).unwrap();
-                let device = pipeline.device();
-                let model_name = pipeline.name().to_string();
-                let PreparedInputs {
-                    tokens,
-                    positions,
-                    metadata,
-                } = if seqs.values().nth(0).unwrap().deref().is_prompt() {
-                    e.prepare_prompt(&scheduled, device)
+            let mut adapter_batches = Vec::<VecDeque<Arc<SequenceGroup>>>::new();
+            let mut adapter_batch_map = HashMap::<Option<String>, usize>::new();
+            for group in &scheduled {
+                let adapter_key = group.adapter_id.clone();
+                let batch_idx = if let Some(idx) = adapter_batch_map.get(&adapter_key) {
+                    *idx
                 } else {
-                    e.prepare_decode(&scheduled, device)
-                }?;
-
-                let x = if is_embedding {
-                    pipeline.forward_embedding(
-                        tokens,
-                        &positions,
-                        Some(&cache_engine.get_kv_cache()),
-                        &metadata,
-                    )?
-                } else {
-                    pipeline.forward(
-                        tokens,
-                        &positions,
-                        Some(&cache_engine.get_kv_cache()),
-                        &metadata,
-                    )?
+                    let idx = adapter_batches.len();
+                    adapter_batches.push(VecDeque::new());
+                    adapter_batch_map.insert(adapter_key, idx);
+                    idx
                 };
-
-                (x, metadata.is_prefill, model_name)
-            };
-
-            if is_embedding {
-                if is_prompt {
-                    let mut e = engine.write();
-                    //Process embedding response
-                    let mut start_idx = 0;
-                    for group in &scheduled {
-                        let seq = group.get_seqs().values().nth(0).unwrap();
-                        let prompt_len = seq.deref().get_prompt_len();
-                        let end_idx = start_idx + prompt_len;
-
-                        //extract sequence embedding
-                        let seq_embedding = logits.narrow(0, start_idx, prompt_len)?;
-
-                        //Pooling
-                        let pooled_embedding = match group.embedding_type {
-                            crate::openai::requests::EmbeddingType::Last => {
-                                seq_embedding.narrow(0, prompt_len - 1, 1)?.squeeze(0)?
-                            }
-                            crate::openai::requests::EmbeddingType::Mean => {
-                                seq_embedding.mean(0)?
-                            }
-                        };
-                        info!("Resulting embedding shape: {:?}", pooled_embedding.shape());
-
-                        let vec_embedding = pooled_embedding
-                            .to_dtype(candle_core::DType::F32)?
-                            .to_vec1::<f32>()?;
-
-                        let output = match group.encoding_format {
-                            crate::openai::requests::EncodingFormat::Float => {
-                                EmbeddingOutput::Vector(vec_embedding)
-                            }
-                            crate::openai::requests::EncodingFormat::Base64 => {
-                                use base64::{engine::general_purpose::STANDARD, Engine as _};
-                                let bytes = unsafe {
-                                    std::slice::from_raw_parts(
-                                        vec_embedding.as_ptr() as *const u8,
-                                        vec_embedding.len() * 4,
-                                    )
-                                };
-                                EmbeddingOutput::Base64(STANDARD.encode(bytes))
-                            }
-                        };
-
-                        if let Some(sender) = &group.sender {
-                            let response = EmbeddingResponse {
-                                object: "list",
-                                data: vec![EmbeddingData {
-                                    object: "embedding",
-                                    embedding: output,
-                                    index: 0,
-                                }],
-                                model: model_name.clone(),
-                                usage: EmbeddingUsage {
-                                    prompt_tokens: prompt_len,
-                                    total_tokens: prompt_len,
-                                },
-                            };
-                            let _ = sender.send(ChatResponse::Embedding(response));
-                        } else {
-                            tracing::error!("No sender for embedding group!");
-                        }
-                        seq.deref_mut().set_finish_reason("stop".to_string());
-                        start_idx = end_idx;
-                    }
-
-                    e.scheduler.free_finished_sequence_groups();
-                }
-                continue;
-            }
-
-            if is_prompt {
-                let mut e = engine.write();
-                let prefill_chunk_size = if cfg!(feature = "flash-decoding") {
-                    e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE / 2)
-                } else {
-                    e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE)
-                };
-
-                if prefill_chunk_size > 0 {
-                    let (finished_indices, finished_groups) = e
-                        .scheduler
-                        .filter_prefill_finished(&scheduled, prefill_chunk_size);
-
-                    if finished_indices.is_empty() {
-                        continue;
-                    }
-                    scheduled = finished_groups;
-                    let batch = finished_indices.len();
-                    logits = logits.index_select(
-                        &Tensor::from_vec(finished_indices, (batch,), logits.device())?,
-                        0,
-                    )?;
-                }
+                adapter_batches[batch_idx].push_back(group.clone());
             }
 
             #[cfg(feature = "nccl")]
@@ -660,20 +544,183 @@ impl LLMEngine {
             #[cfg(not(feature = "nccl"))]
             let do_sample = rank == 0;
 
-            let optional_results = if do_sample {
-                let sample = {
-                    //only the first rank thread perform sampling
-                    let mut e = engine.write();
-                    let default_pipeline = e.get_mut_pipeline(0usize).unwrap().0.as_mut();
-                    default_pipeline.sample(&logits, &scheduled).unwrap()
-                };
+            let mut sampled_groups = VecDeque::new();
+            let mut sampled_results = Vec::<TokenOrFinishReason>::new();
 
+            for mut batch_groups in adapter_batches {
+                if batch_groups.is_empty() {
+                    continue;
+                }
+
+                let selected_adapter_id = batch_groups[0].adapter_id.clone();
+                crate::openai::lora::set_active_adapter(selected_adapter_id.clone());
+                let forward_result = (|| -> Result<(Tensor, bool, String)> {
+                    let e = engine.read();
+                    let (pipeline, cache_engine) = e.get_pipeline(rank).unwrap();
+                    let device = pipeline.device();
+                    let model_name = pipeline.name().to_string();
+                    let seqs = batch_groups[0].get_seqs();
+                    let PreparedInputs {
+                        tokens,
+                        positions,
+                        metadata,
+                    } = if seqs.values().nth(0).unwrap().deref().is_prompt() {
+                        e.prepare_prompt(&batch_groups, device)
+                    } else {
+                        e.prepare_decode(&batch_groups, device)
+                    }?;
+
+                    let x = if is_embedding {
+                        pipeline.forward_embedding(
+                            tokens,
+                            &positions,
+                            Some(&cache_engine.get_kv_cache()),
+                            &metadata,
+                        )?
+                    } else {
+                        pipeline.forward(
+                            tokens,
+                            &positions,
+                            Some(&cache_engine.get_kv_cache()),
+                            &metadata,
+                        )?
+                    };
+                    Ok((x, metadata.is_prefill, model_name))
+                })();
+                crate::openai::lora::clear_active_adapter();
+
+                let (mut logits, is_prompt, model_name) = forward_result?;
+
+                if let Some(adapter_id) = selected_adapter_id.as_deref() {
+                    if let Some(manager) = crate::openai::lora::global_lora_manager() {
+                        manager.touch_usage(adapter_id);
+                    }
+                }
+
+                if is_embedding {
+                    if is_prompt {
+                        // Process embedding response for this adapter sub-batch.
+                        let mut start_idx = 0;
+                        for group in &batch_groups {
+                            let seq = group.get_seqs().values().nth(0).unwrap();
+                            let prompt_len = seq.deref().get_prompt_len();
+                            let end_idx = start_idx + prompt_len;
+
+                            let seq_embedding = logits.narrow(0, start_idx, prompt_len)?;
+                            let pooled_embedding = match group.embedding_type {
+                                crate::openai::requests::EmbeddingType::Last => {
+                                    seq_embedding.narrow(0, prompt_len - 1, 1)?.squeeze(0)?
+                                }
+                                crate::openai::requests::EmbeddingType::Mean => {
+                                    seq_embedding.mean(0)?
+                                }
+                            };
+                            info!("Resulting embedding shape: {:?}", pooled_embedding.shape());
+
+                            let vec_embedding = pooled_embedding
+                                .to_dtype(candle_core::DType::F32)?
+                                .to_vec1::<f32>()?;
+
+                            let output = match group.encoding_format {
+                                crate::openai::requests::EncodingFormat::Float => {
+                                    EmbeddingOutput::Vector(vec_embedding)
+                                }
+                                crate::openai::requests::EncodingFormat::Base64 => {
+                                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            vec_embedding.as_ptr() as *const u8,
+                                            vec_embedding.len() * 4,
+                                        )
+                                    };
+                                    EmbeddingOutput::Base64(STANDARD.encode(bytes))
+                                }
+                            };
+
+                            if let Some(sender) = &group.sender {
+                                let response = EmbeddingResponse {
+                                    object: "list",
+                                    data: vec![EmbeddingData {
+                                        object: "embedding",
+                                        embedding: output,
+                                        index: 0,
+                                    }],
+                                    model: model_name.clone(),
+                                    usage: EmbeddingUsage {
+                                        prompt_tokens: prompt_len,
+                                        total_tokens: prompt_len,
+                                    },
+                                };
+                                let _ = sender.send(ChatResponse::Embedding(response));
+                            } else {
+                                tracing::error!("No sender for embedding group!");
+                            }
+                            seq.deref_mut().set_finish_reason("stop".to_string());
+                            start_idx = end_idx;
+                        }
+                    }
+                    continue;
+                }
+
+                if is_prompt {
+                    let mut e = engine.write();
+                    let prefill_chunk_size = if cfg!(feature = "flash-decoding") {
+                        e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE / 2)
+                    } else {
+                        e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE)
+                    };
+
+                    if prefill_chunk_size > 0 {
+                        let (finished_indices, finished_groups) = e
+                            .scheduler
+                            .filter_prefill_finished(&batch_groups, prefill_chunk_size);
+
+                        if finished_indices.is_empty() {
+                            continue;
+                        }
+                        batch_groups = finished_groups;
+                        let batch = finished_indices.len();
+                        logits = logits.index_select(
+                            &Tensor::from_vec(finished_indices, (batch,), logits.device())?,
+                            0,
+                        )?;
+                    }
+                }
+
+                if batch_groups.is_empty() {
+                    continue;
+                }
+
+                if do_sample {
+                    let sample = {
+                        let mut e = engine.write();
+                        let default_pipeline = e.get_mut_pipeline(0usize).unwrap().0.as_mut();
+                        default_pipeline.sample(&logits, &batch_groups).unwrap()
+                    };
+                    sampled_groups.extend(batch_groups.iter().cloned());
+                    sampled_results.extend(sample);
+                } else {
+                    #[cfg(feature = "nccl")]
+                    if multi_process && !DaemonManager::is_master_rank() {
+                        let _ = logits.to_device(&Device::Cpu).unwrap(); //sync
+                        sampled_groups.extend(batch_groups.iter().cloned());
+                    }
+                }
+            }
+
+            if is_embedding {
+                let mut e = engine.write();
+                e.scheduler.free_finished_sequence_groups();
+                continue;
+            }
+
+            let optional_results = if do_sample {
                 #[cfg(feature = "nccl")]
                 if multi_process {
                     let e = engine.read();
                     let mut daemon_manager = e.daemon_manager.write();
                     let mut logprobs: Vec<TaskSampleData> = Vec::new();
-                    for s in &sample {
+                    for s in &sampled_results {
                         match s {
                             Either::Left(logprob) => {
                                 logprobs.push(TaskSampleData::Token(logprob.clone()))
@@ -688,11 +735,10 @@ impl LLMEngine {
                         .unwrap()
                         .send_message(&MessageType::Sample(logprobs));
                 }
-                Some(sample)
+                Some(sampled_results)
             } else {
                 #[cfg(feature = "nccl")]
                 if multi_process && !DaemonManager::is_master_rank() {
-                    let _ = logits.to_device(&Device::Cpu).unwrap(); //sync
                     let message = {
                         let e = engine.read();
                         let mut daemon_manager = e.daemon_manager.write();
@@ -738,7 +784,7 @@ impl LLMEngine {
 
             //only the first rank thread perform stream response
             let results = optional_results.unwrap();
-            for (result_, group) in zip(results, &scheduled) {
+            for (result_, group) in zip(results, &sampled_groups) {
                 match result_ {
                     Either::Left(logprobs) => {
                         let seq = group.get_seqs().values().nth(0).unwrap();
@@ -1528,6 +1574,7 @@ impl LLMEngine {
         is_embedding: bool,
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
+        adapter_id: Option<String>,
         sender: Option<Sender<ChatResponse>>,
     ) -> SequenceGroup {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
@@ -1546,6 +1593,7 @@ impl LLMEngine {
             is_embedding,
             encoding_format,
             embedding_type,
+            adapter_id,
             sender,
         )
     }
@@ -1560,6 +1608,7 @@ impl LLMEngine {
         is_embedding: bool,
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
+        adapter_id: Option<String>,
         sender: Option<Arc<Sender<ChatResponse>>>,
         sync_notify: Option<Arc<Notify>>,
     ) {
@@ -1597,6 +1646,7 @@ impl LLMEngine {
             is_embedding,
             encoding_format,
             embedding_type,
+            adapter_id,
         };
         let mut waiting_tasks = self.waiting_tasks.write();
         waiting_tasks.push(task);

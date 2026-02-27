@@ -8,9 +8,11 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokenizers::{EncodeInput, Encoding, Tokenizer};
+pub mod backend_router;
 #[cfg(feature = "nccl")]
 pub mod communicator;
 pub mod distributed;
+pub mod lora;
 pub mod requests;
 pub mod responses;
 pub mod sampling_params;
@@ -79,7 +81,11 @@ pub struct OpenAIServerData {
     pub pipeline_config: PipelineConfig,
     pub record_conversation: bool,
     pub device: Device,
+    pub runtime_local_only_strict: bool,
     pub mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    pub lora_manager: Arc<lora::LoRAManager>,
+    pub backend_router: Arc<backend_router::BackendRouter>,
+    pub sticky_adapters: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -94,6 +100,7 @@ pub struct TaskData {
     pub is_embedding: bool,
     pub encoding_format: requests::EncodingFormat,
     pub embedding_type: requests::EmbeddingType,
+    pub adapter_id: Option<String>,
 }
 
 pub mod conversation;

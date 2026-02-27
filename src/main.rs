@@ -7,8 +7,12 @@ use axum::{
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "nccl")]
 use candle_vllm::backend::heartbeat;
+use candle_vllm::openai::backend_router::{BackendRouter, CloudBackendConfig};
 use candle_vllm::openai::models::Config;
-use candle_vllm::openai::openai_server::{chat_completions, create_embeddings};
+use candle_vllm::openai::openai_server::{
+    adapters_status, chat_completions, create_embeddings, get_adapter, list_adapters, load_adapter,
+    register_adapter, unload_adapter, warmup_adapters,
+};
 use candle_vllm::openai::pipelines::llm_engine::LLMEngine;
 use candle_vllm::openai::pipelines::pipeline::DefaultLoader;
 use candle_vllm::openai::sampling_params::GenerationConfig;
@@ -21,7 +25,9 @@ use colored::*;
 use local_ip_address::local_ip;
 use rustchatui::start_ui_server;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
@@ -152,6 +158,30 @@ struct Args {
     /// Path to MCP config file (multi-server mode)
     #[arg(long)]
     mcp_config: Option<String>,
+
+    /// Comma-separated cloud backends in `id=https://host:port` or `https://host:port` form.
+    #[arg(long, value_delimiter = ',')]
+    cloud_backends: Option<Vec<String>>,
+
+    /// Relative weight for local backend score in hybrid mode.
+    #[arg(long, default_value_t = 1.0)]
+    hybrid_local_weight: f64,
+
+    /// Relative weight for cloud backend score in hybrid mode.
+    #[arg(long, default_value_t = 1.0)]
+    hybrid_cloud_weight: f64,
+
+    /// Refresh interval for cloud adapter status in hybrid/cloud routing.
+    #[arg(long, default_value_t = 5000)]
+    hybrid_status_ttl_ms: u64,
+
+    /// Automatically warm adapters on the non-selected cloud backends in hybrid mode.
+    #[arg(long, default_value_t = false)]
+    hybrid_adapter_autosync: bool,
+
+    /// Enforce runtime-node boundary: public API accepts only local execution mode/scope.
+    #[arg(long, default_value_t = true)]
+    runtime_local_only_strict: bool,
 }
 
 fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Result<()> {
@@ -503,12 +533,62 @@ async fn main() -> Result<()> {
         None
     };
 
+    let runtime_model_name = {
+        let engine = llm_engine.read();
+        let (pipeline, _) = engine
+            .get_pipeline(0)
+            .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
+        pipeline.name().to_string()
+    };
+
+    let cloud_specs = args.cloud_backends.clone().unwrap_or_default();
+    let mut cloud_backends =
+        CloudBackendConfig::parse_specs(&cloud_specs).map_err(candle_core::Error::msg)?;
+    if args.runtime_local_only_strict && !cloud_backends.is_empty() {
+        warn!(
+            "runtime_local_only_strict=true; ignoring configured cloud backends for external routing."
+        );
+        cloud_backends.clear();
+    }
+    if !cloud_backends.is_empty() {
+        let rendered = cloud_backends
+            .iter()
+            .map(|b| format!("{}={}", b.id, b.base_url))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!("Configured cloud backends: {}", rendered);
+    }
+
+    let backend_router = Arc::new(
+        BackendRouter::new(
+            cloud_backends,
+            args.hybrid_local_weight,
+            args.hybrid_cloud_weight,
+            Duration::from_millis(args.hybrid_status_ttl_ms),
+            args.hybrid_adapter_autosync,
+            Some(runtime_model_name.clone()),
+        )
+        .map_err(|err| candle_core::Error::msg(err.to_string()))?,
+    );
+
+    let lora_manager = Arc::new(candle_vllm::openai::lora::LoRAManager::new(
+        Some(runtime_model_name),
+        8,
+        64,
+        "fallback",
+    ));
+    candle_vllm::openai::lora::set_global_lora_manager(Arc::clone(&lora_manager));
+
     let server_data = OpenAIServerData {
         pipeline_config,
         model: llm_engine,
         record_conversation: args.record_conversation,
         device: Device::Cpu,
+        runtime_local_only_strict: args.runtime_local_only_strict,
         mcp_manager: mcp_manager.clone(),
+        lora_manager,
+        backend_router,
+        sticky_adapters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
     };
 
     if let Some(manager) = &mcp_manager {
@@ -575,11 +655,17 @@ async fn main() -> Result<()> {
         .route(
             "/v1/models",
             get(|State(data): State<Arc<OpenAIServerData>>| async move {
-                let model_name = {
+                let (model_name, lora_status) = {
                     let engine = data.model.read();
                     let (pipeline, _) = engine.get_pipeline(0).unwrap();
-                    pipeline.name().to_string()
+                    (pipeline.name().to_string(), data.lora_manager.status())
                 };
+                let cloud_backends = data.backend_router.cloud_backend_ids();
+                let mut execution_modes = vec!["local"];
+                if !data.runtime_local_only_strict && !cloud_backends.is_empty() {
+                    execution_modes.push("cloud");
+                    execution_modes.push("hybrid");
+                }
                 Json(json!({
                     "object": "list",
                     "data": [
@@ -591,7 +677,12 @@ async fn main() -> Result<()> {
                                 .unwrap()
                                 .as_millis() as i64,
                             "owned_by": "candle-vllm",
-                            "permission": []
+                            "permission": [],
+                            "max_active_loras": lora_status.max_active_loras,
+                            "loaded_loras": lora_status.loaded_loras,
+                            "lora_mode": lora_status.lora_mode,
+                            "execution_modes": execution_modes,
+                            "cloud_backends": cloud_backends
                         }
                     ]
                 }))
@@ -599,6 +690,12 @@ async fn main() -> Result<()> {
         )
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(create_embeddings))
+        .route("/v1/adapters", post(register_adapter).get(list_adapters))
+        .route("/v1/adapters/:id", get(get_adapter))
+        .route("/v1/adapters/:id/load", post(load_adapter))
+        .route("/v1/adapters/:id/unload", post(unload_adapter))
+        .route("/v1/adapters/status", get(adapters_status))
+        .route("/v1/adapters/warmup", post(warmup_adapters))
         .layer(cors_layer)
         .with_state(Arc::new(server_data));
 

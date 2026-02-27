@@ -280,6 +280,7 @@ pub struct SequenceGroup {
     pub is_embedding: bool,
     pub encoding_format: crate::openai::requests::EncodingFormat,
     pub embedding_type: crate::openai::requests::EmbeddingType,
+    pub adapter_id: Option<String>,
     pub sender: Option<Sender<ChatResponse>>,
     // Tool call and reasoning tracking
     pub accumulated_output: String,
@@ -302,6 +303,7 @@ impl SequenceGroup {
         is_embedding: bool,
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
+        adapter_id: Option<String>,
         sender: Option<Sender<ChatResponse>>,
     ) -> Self {
         let mut seq_map = HashMap::new();
@@ -319,6 +321,7 @@ impl SequenceGroup {
             is_embedding,
             encoding_format,
             embedding_type,
+            adapter_id,
             sender,
             accumulated_output: "".to_string(),
             tool_call_state: ToolCallState::Normal,
@@ -385,5 +388,9 @@ impl SequenceGroup {
 
     pub fn get_created_time(&self) -> SystemTime {
         self.created_time
+    }
+
+    pub fn adapter_id(&self) -> Option<&str> {
+        self.adapter_id.as_deref()
     }
 }

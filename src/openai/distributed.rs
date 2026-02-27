@@ -1,3 +1,4 @@
+use crate::openai::lora::{compute_active_lora_delta, ShardSpec};
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
 #[cfg(feature = "nccl")]
 pub use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id};
@@ -39,14 +40,36 @@ pub struct ReplicatedLinear {
 pub struct TensorParallelColumnLinear {
     linear: Linear,
     bias: Option<Tensor>,
+    module_name: Option<String>,
+    tp_rank: usize,
+    tp_world_size: usize,
 }
 
 impl TensorParallelColumnLinear {
     pub fn new(linear: Linear) -> Self {
-        Self { linear, bias: None }
+        Self {
+            linear,
+            bias: None,
+            module_name: None,
+            tp_rank: 0,
+            tp_world_size: 1,
+        }
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let mut xs = self.linear.forward(x)?;
+        if let Some(module_name) = self.module_name.as_deref() {
+            if let Some(delta) = compute_active_lora_delta(
+                module_name,
+                x,
+                xs.dtype(),
+                Some(ShardSpec::Column {
+                    rank: self.tp_rank,
+                    world_size: self.tp_world_size,
+                }),
+            )? {
+                xs = xs.broadcast_add(&delta)?;
+            }
+        }
         if let Some(bias) = &self.bias {
             xs = xs.broadcast_add(bias)?;
         }
@@ -84,6 +107,9 @@ pub struct TensorParallelRowLinear {
     #[cfg(feature = "nccl")]
     all_reduce: AllReduce,
     bias: Option<Tensor>,
+    module_name: Option<String>,
+    tp_rank: usize,
+    tp_world_size: usize,
 }
 
 #[allow(dead_code)]
@@ -165,29 +191,52 @@ impl TensorParallelRowLinear {
     #[allow(unused_variables)]
     pub fn new(linear: Linear, comm: Rc<Comm>) -> Self {
         #[cfg(feature = "nccl")]
-        let all_reduce = AllReduce { comm };
+        let all_reduce = AllReduce { comm: comm.clone() };
+        let tp_rank = comm.rank();
+        let tp_world_size = comm.world_size();
         Self {
             linear,
             #[cfg(feature = "nccl")]
             all_reduce,
             bias: None,
+            module_name: None,
+            tp_rank,
+            tp_world_size,
         }
     }
 
     #[allow(unused_variables)]
     pub fn new_with_bias(linear: Linear, bias: Option<Tensor>, comm: Rc<Comm>) -> Self {
         #[cfg(feature = "nccl")]
-        let all_reduce = AllReduce { comm };
+        let all_reduce = AllReduce { comm: comm.clone() };
+        let tp_rank = comm.rank();
+        let tp_world_size = comm.world_size();
         Self {
             linear,
             #[cfg(feature = "nccl")]
             all_reduce,
             bias,
+            module_name: None,
+            tp_rank,
+            tp_world_size,
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let xs = self.linear.forward(x)?;
+        let mut xs = self.linear.forward(x)?;
+        if let Some(module_name) = self.module_name.as_deref() {
+            if let Some(delta) = compute_active_lora_delta(
+                module_name,
+                x,
+                xs.dtype(),
+                Some(ShardSpec::Row {
+                    rank: self.tp_rank,
+                    world_size: self.tp_world_size,
+                }),
+            )? {
+                xs = xs.broadcast_add(&delta)?;
+            }
+        }
         #[cfg(feature = "nccl")]
         let xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
 
@@ -221,6 +270,14 @@ impl TensorParallelColumnLinear {
         let rank = comm.rank();
         let size = comm.world_size();
         let dtype = vb.dtype();
+        let module_name = {
+            let prefix = vb.prefix();
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix)
+            }
+        };
         let bs = if bias {
             let full_bias = vb.get((out_dim,), "bias");
             if full_bias.is_ok() {
@@ -251,7 +308,13 @@ impl TensorParallelColumnLinear {
             dtype,
             None,
         )?;
-        Ok(Self { linear, bias: bs })
+        Ok(Self {
+            linear,
+            bias: bs,
+            module_name,
+            tp_rank: rank,
+            tp_world_size: size,
+        })
     }
 
     // pub fn load_multi(vb: VarBuilder, prefixes: &[&str], comm: Rc<Comm>) -> Result<Self> {
@@ -295,7 +358,13 @@ impl MergedParallelColumnLinear {
                 Some((chunk_idx, chunk)),
             )?;
 
-            let ln = TensorParallelColumnLinear { linear, bias: None };
+            let ln = TensorParallelColumnLinear {
+                linear,
+                bias: None,
+                module_name: None,
+                tp_rank: rank,
+                tp_world_size: size,
+            };
             vec_linear.push(ln);
         }
         Ok(Self {
@@ -349,7 +418,13 @@ impl MergedParallelColumnLinear {
             } else {
                 LinearX::Linear(ln)
             };
-            let ln = TensorParallelColumnLinear { linear, bias: None };
+            let ln = TensorParallelColumnLinear {
+                linear,
+                bias: None,
+                module_name: None,
+                tp_rank: comm.rank(),
+                tp_world_size: comm.world_size(),
+            };
             vec_linear.push(ln);
         }
 
@@ -373,6 +448,14 @@ impl TensorParallelRowLinear {
         let rank = comm.rank();
         let size = comm.world_size();
         let dtype = vb.dtype();
+        let module_name = {
+            let prefix = vb.prefix();
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix)
+            }
+        };
         let bs = if bias {
             Some(vb.get((out_dim,), "bias")?)
         } else {
@@ -388,7 +471,11 @@ impl TensorParallelRowLinear {
             dtype,
             None,
         )?;
-        Ok(Self::new_with_bias(linear, bs, comm))
+        let mut layer = Self::new_with_bias(linear, bs, comm);
+        layer.module_name = module_name;
+        layer.tp_rank = rank;
+        layer.tp_world_size = size;
+        Ok(layer)
     }
 }
 

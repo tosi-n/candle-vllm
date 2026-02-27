@@ -240,12 +240,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn block(block_id: usize, block_size: usize) -> Arc<PhysicalTokenBlock> {
-        Arc::new(PhysicalTokenBlock(Mutex::new(_PhysicalTokenBlock {
-            block_id,
-            block_size,
-            refcount: 1,
-            is_gpu: true,
-        })))
+        Arc::new(PhysicalTokenBlock(Mutex::new(_PhysicalTokenBlock::new(
+            block_id, block_size, 1, true,
+        ))))
     }
 
     #[test]

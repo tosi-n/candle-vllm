@@ -55,6 +55,17 @@ pub struct _PhysicalTokenBlock {
 
 pub struct PhysicalTokenBlock(pub Mutex<_PhysicalTokenBlock>);
 
+impl _PhysicalTokenBlock {
+    pub fn new(block_id: usize, block_size: usize, refcount: usize, is_gpu: bool) -> Self {
+        Self {
+            block_id,
+            block_size,
+            refcount,
+            is_gpu,
+        }
+    }
+}
+
 impl PhysicalTokenBlock {
     pub fn deref_mut(&self) -> MutexGuard<'_, _PhysicalTokenBlock> {
         loop {
@@ -620,6 +631,7 @@ mod tests {
             false,
             EncodingFormat::Float,
             EmbeddingType::Last,
+            None,
             None,
         );
         (group, seq)

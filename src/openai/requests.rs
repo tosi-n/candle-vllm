@@ -69,6 +69,20 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<crate::tools::Tool>>,
     #[serde(default)]
     pub tool_choice: Option<crate::tools::ToolChoice>,
+    #[serde(default)]
+    pub metadata: Option<ChatCompletionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatCompletionMetadata {
+    #[serde(default)]
+    pub hybrie: Option<HybrieMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HybrieMetadata {
+    #[serde(default)]
+    pub adapter_id: Option<String>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -98,6 +112,7 @@ impl Default for ChatCompletionRequest {
             thinking: None,
             tools: None,
             tool_choice: None,
+            metadata: None,
         }
     }
 }

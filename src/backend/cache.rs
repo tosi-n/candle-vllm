@@ -11,7 +11,9 @@ use candle_core::{
     cuda_backend::CudaStorageSlice,
     Device, IndexOp, Result, Storage, Tensor,
 };
-use std::{collections::HashMap, iter::zip};
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::iter::zip;
 
 /// # Safety
 /// Unsafe due to passing pointers
