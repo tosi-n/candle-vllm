@@ -83,6 +83,14 @@ pub struct ChatCompletionMetadata {
 pub struct HybrieMetadata {
     #[serde(default)]
     pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub adapter_timeline: Option<Vec<HybrieAdapterStep>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybrieAdapterStep {
+    pub start_step: usize,
+    pub adapter_id: String,
 }
 
 impl Default for ChatCompletionRequest {

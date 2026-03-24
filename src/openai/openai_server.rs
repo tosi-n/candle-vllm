@@ -270,6 +270,27 @@ fn parse_adapter_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Opt
         .filter(|id| !id.is_empty())
 }
 
+fn parse_adapter_timeline(
+    request: &ChatCompletionRequest,
+) -> Option<Vec<crate::openai::requests::HybrieAdapterStep>> {
+    let mut timeline = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.hybrie.as_ref())
+        .and_then(|hybrie| hybrie.adapter_timeline.clone())?;
+
+    timeline.retain(|step| !step.adapter_id.trim().is_empty());
+    if timeline.is_empty() {
+        return None;
+    }
+
+    timeline.sort_by_key(|step| step.start_step);
+    for step in &mut timeline {
+        step.adapter_id = step.adapter_id.trim().to_string();
+    }
+    Some(timeline)
+}
+
 fn parse_session_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-hybrie-session-id")
@@ -707,6 +728,7 @@ pub async fn chat_completions(
 
     let session_id = parse_session_id(&headers);
     let mut adapter_id = parse_adapter_id(&headers, &request);
+    let adapter_timeline = parse_adapter_timeline(&request);
     if adapter_id.is_none() {
         if let Some(session_id) = session_id.as_ref() {
             adapter_id = data.sticky_adapters.read().get(session_id).cloned();
@@ -885,6 +907,7 @@ pub async fn chat_completions(
     };
     let data_for_engine = data.clone();
     let adapter_id_for_engine = adapter_id.clone();
+    let adapter_timeline_for_engine = adapter_timeline.clone();
     let local_started = Instant::now();
     data.backend_router.begin_local_request();
 
@@ -903,6 +926,7 @@ pub async fn chat_completions(
                     EncodingFormat::default(),
                     EmbeddingType::default(),
                     adapter_id_for_engine,
+                    adapter_timeline_for_engine,
                     if stream_request {
                         Some(Arc::new(response_tx))
                     } else {
@@ -1089,6 +1113,7 @@ pub async fn create_embeddings(
                     true, //is_embedding
                     request.encoding_format.clone(),
                     request.embedding_type.clone(),
+                    None,
                     None,
                     Some(Arc::new(response_tx)),
                     None,
@@ -1669,17 +1694,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-hybrie-execution-mode", HeaderValue::from_static("cloud"));
         let err = parse_execution_mode(&headers, None, true).expect_err("cloud should be rejected");
-        assert!(err
-            .to_string()
-            .contains("local-only strict"));
+        assert!(err.to_string().contains("local-only strict"));
     }
 
     #[test]
     fn execution_mode_accepts_cloud_header_when_not_strict() {
         let mut headers = HeaderMap::new();
         headers.insert("x-hybrie-execution-mode", HeaderValue::from_static("cloud"));
-        let mode =
-            parse_execution_mode(&headers, None, false).expect("cloud should be accepted");
+        let mode = parse_execution_mode(&headers, None, false).expect("cloud should be accepted");
         assert_eq!(mode, ExecutionMode::Cloud);
     }
 
@@ -1688,23 +1710,52 @@ mod tests {
         let headers = HeaderMap::new();
         let err = parse_execution_mode(&headers, Some("hybrid/qwen"), true)
             .expect_err("hybrid prefix should be rejected");
-        assert!(err
-            .to_string()
-            .contains("local-only strict"));
+        assert!(err.to_string().contains("local-only strict"));
     }
 
     #[test]
     fn adapter_scope_rejects_cloud_in_strict_runtime() {
         let err =
             parse_adapter_scope(Some("cloud"), true).expect_err("cloud scope should be rejected");
-        assert!(err
-            .to_string()
-            .contains("local-only strict"));
+        assert!(err.to_string().contains("local-only strict"));
     }
 
     #[test]
     fn adapter_scope_defaults_to_local() {
         let scope = parse_adapter_scope(None, true).expect("default scope should parse");
         assert_eq!(scope, AdapterScope::Local);
+    }
+
+    #[test]
+    fn adapter_timeline_is_sorted_and_trimmed() {
+        let request = ChatCompletionRequest {
+            metadata: Some(crate::openai::requests::ChatCompletionMetadata {
+                hybrie: Some(crate::openai::requests::HybrieMetadata {
+                    adapter_id: Some("base".to_string()),
+                    adapter_timeline: Some(vec![
+                        crate::openai::requests::HybrieAdapterStep {
+                            start_step: 10,
+                            adapter_id: "  role_b ".to_string(),
+                        },
+                        crate::openai::requests::HybrieAdapterStep {
+                            start_step: 2,
+                            adapter_id: "role_a".to_string(),
+                        },
+                        crate::openai::requests::HybrieAdapterStep {
+                            start_step: 12,
+                            adapter_id: " ".to_string(),
+                        },
+                    ]),
+                }),
+            }),
+            ..ChatCompletionRequest::default()
+        };
+
+        let timeline = parse_adapter_timeline(&request).expect("timeline should parse");
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].start_step, 2);
+        assert_eq!(timeline[0].adapter_id, "role_a");
+        assert_eq!(timeline[1].start_step, 10);
+        assert_eq!(timeline[1].adapter_id, "role_b");
     }
 }

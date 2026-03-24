@@ -397,6 +397,7 @@ impl DefaultLoader {
                         | "phi3"
                         | "qwen2"
                         | "qwen3"
+                        | "qwen3_5"
                         | "qwen2moe"
                         | "qwen3moe"
                         | "glm4"
@@ -465,7 +466,7 @@ impl DefaultLoader {
                         SeparatorStyle::Phi,
                     )
                 }
-                "qwen2" | "qwen3" => {
+                "qwen2" | "qwen3" | "qwen3_5" => {
                     let model = GGUFQWen::from_gguf(
                         &content,
                         &mut file,
@@ -528,7 +529,11 @@ impl DefaultLoader {
                 "LlamaForCausalLM" => Llama::load_config(&cfile, isq)?,
                 "PhiForCausalLM" | "Phi2ForCausalLM" => Phi2::load_config(&cfile, isq)?,
                 "Phi3ForCausalLM" | "Phi4ForCausalLM" => Phi4::load_config(&cfile, isq)?,
-                "Qwen2ForCausalLM" | "Qwen3ForCausalLM" => Qwen::load_config(&cfile, isq)?,
+                "Qwen2ForCausalLM"
+                | "Qwen3ForCausalLM"
+                | "Qwen3_5ForCausalLM"
+                | "Qwen3_5ForConditionalGeneration"
+                | "Qwen3_5_VLForConditionalGeneration" => Qwen::load_config(&cfile, isq)?,
                 "Qwen2MoeForCausalLM" | "Qwen3MoeForCausalLM" => {
                     Qwen3MoE::load_config(&cfile, isq)?
                 }
@@ -649,7 +654,11 @@ impl DefaultLoader {
                             )),
                             SeparatorStyle::Phi,
                         ),
-                        "Qwen2ForCausalLM" | "Qwen3ForCausalLM" => (
+                        "Qwen2ForCausalLM"
+                        | "Qwen3ForCausalLM"
+                        | "Qwen3_5ForCausalLM"
+                        | "Qwen3_5ForConditionalGeneration"
+                        | "Qwen3_5_VLForConditionalGeneration" => (
                             LLMModel::Qwen(Arc::new(
                                 Qwen::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),

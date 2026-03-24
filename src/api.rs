@@ -521,6 +521,7 @@ impl Engine {
                 crate::openai::requests::EncodingFormat::default(),
                 crate::openai::requests::EmbeddingType::default(),
                 None,
+                None,
                 None, // streamer
                 Some(req_notify.clone()), // Use the local notify
             );
@@ -618,6 +619,7 @@ impl Engine {
                 true, // is_embedding
                 request.encoding_format.clone(),
                 request.embedding_type.clone(),
+                None,
                 None,
                 Some(std::sync::Arc::new(tx)),
                 None,

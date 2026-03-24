@@ -24,14 +24,16 @@ use crate::{
     },
     InputMetadata,
 };
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use either::Either;
 use flume::Sender;
+use half::{bf16, f16};
 use parking_lot::RwLock;
 #[cfg(feature = "nccl")]
 use rayon::iter::IntoParallelRefIterator;
 #[cfg(feature = "nccl")]
 use rayon::iter::ParallelIterator;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use std::{
@@ -47,6 +49,25 @@ struct PreparedInputs {
     tokens: Tensor,
     positions: Tensor,
     metadata: InputMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvLayerPayload {
+    pub key_shape: Vec<usize>,
+    pub value_shape: Vec<usize>,
+    pub key_bytes: Vec<u8>,
+    pub value_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvSessionPayload {
+    pub session_id: String,
+    pub seq_id: usize,
+    pub prompt_len: usize,
+    pub total_len: usize,
+    pub adapter_id: Option<String>,
+    pub block_ids: Vec<usize>,
+    pub layers: Vec<KvLayerPayload>,
 }
 
 const _PAD_SLOT_ID: i64 = -1;
@@ -268,6 +289,7 @@ impl LLMEngine {
                             task.encoding_format,
                             task.embedding_type,
                             task.adapter_id.clone(),
+                            task.adapter_timeline.clone(),
                             None,
                         );
                         tracing::debug!("Daemon process: add_sequence to group {}", task.group_id);
@@ -312,6 +334,7 @@ impl LLMEngine {
                     task.encoding_format.clone(),
                     task.embedding_type.clone(),
                     task.adapter_id.clone(),
+                    task.adapter_timeline.clone(),
                     sender,
                 );
                 tracing::debug!("Main process: add_sequence to group {}", task.group_id);
@@ -523,7 +546,17 @@ impl LLMEngine {
             let mut adapter_batches = Vec::<VecDeque<Arc<SequenceGroup>>>::new();
             let mut adapter_batch_map = HashMap::<Option<String>, usize>::new();
             for group in &scheduled {
-                let adapter_key = group.adapter_id.clone();
+                let is_prompt_group = group
+                    .get_seqs()
+                    .values()
+                    .next()
+                    .map(|seq| seq.deref().is_prompt())
+                    .unwrap_or(true);
+                let adapter_key = if is_prompt_group {
+                    group.adapter_id.clone()
+                } else {
+                    group.resolve_decode_adapter_id()
+                };
                 let batch_idx = if let Some(idx) = adapter_batch_map.get(&adapter_key) {
                     *idx
                 } else {
@@ -1575,6 +1608,7 @@ impl LLMEngine {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
+        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
         sender: Option<Sender<ChatResponse>>,
     ) -> SequenceGroup {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
@@ -1594,6 +1628,7 @@ impl LLMEngine {
             encoding_format,
             embedding_type,
             adapter_id,
+            adapter_timeline,
             sender,
         )
     }
@@ -1609,6 +1644,7 @@ impl LLMEngine {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
+        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
         sender: Option<Arc<Sender<ChatResponse>>>,
         sync_notify: Option<Arc<Notify>>,
     ) {
@@ -1647,6 +1683,7 @@ impl LLMEngine {
             encoding_format,
             embedding_type,
             adapter_id,
+            adapter_timeline,
         };
         let mut waiting_tasks = self.waiting_tasks.write();
         waiting_tasks.push(task);
@@ -1657,4 +1694,250 @@ impl LLMEngine {
     pub fn get_available_kv_tokens(&self) -> usize {
         self.scheduler.get_available_kv_tokens()
     }
+
+    pub fn get_session_lookup(&self, request_id: &str) -> Option<crate::scheduler::SessionLookup> {
+        self.scheduler.lookup_session(request_id)
+    }
+
+    pub fn export_session_payload(&self, request_id: &str) -> Result<Option<KvSessionPayload>> {
+        let Some(lookup) = self.scheduler.lookup_session(request_id) else {
+            return Ok(None);
+        };
+        let (_, cache_engine) = self
+            .get_pipeline(0)
+            .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
+        let kv_cache = cache_engine.get_kv_cache();
+
+        let mut layers = Vec::new();
+        if !lookup.block_ids.is_empty() {
+            for (key_cache, value_cache) in kv_cache.iter() {
+                let key_selected = gather_blocks(key_cache, &lookup.block_ids)?;
+                let value_selected = gather_blocks(value_cache, &lookup.block_ids)?;
+                let key_shape = key_selected.dims().to_vec();
+                let value_shape = value_selected.dims().to_vec();
+                let key_bytes = tensor_to_bytes(&key_selected)?;
+                let value_bytes = tensor_to_bytes(&value_selected)?;
+                layers.push(KvLayerPayload {
+                    key_shape,
+                    value_shape,
+                    key_bytes,
+                    value_bytes,
+                });
+            }
+        }
+
+        Ok(Some(KvSessionPayload {
+            session_id: lookup.request_id,
+            seq_id: lookup.seq_id,
+            prompt_len: lookup.prompt_len,
+            total_len: lookup.total_len,
+            adapter_id: lookup.adapter_id,
+            block_ids: lookup.block_ids,
+            layers,
+        }))
+    }
+
+    pub fn import_session_payload(&mut self, payload: KvSessionPayload) -> Result<()> {
+        let Some(lookup) = self.scheduler.lookup_session(&payload.session_id) else {
+            candle_core::bail!(
+                "Cannot import KV: target session '{}' was not found.",
+                payload.session_id
+            );
+        };
+
+        if lookup.block_ids.len() != payload.block_ids.len() {
+            candle_core::bail!(
+                "KV block count mismatch for session '{}': target={} imported={}",
+                payload.session_id,
+                lookup.block_ids.len(),
+                payload.block_ids.len()
+            );
+        }
+
+        let (_, cache_engine) = self
+            .get_mut_pipeline(0)
+            .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
+        let mut kv_cache = cache_engine.get_kv_cache();
+
+        if payload.layers.len() != kv_cache.len() {
+            candle_core::bail!(
+                "KV layer count mismatch for session '{}': target={} imported={}",
+                payload.session_id,
+                kv_cache.len(),
+                payload.layers.len()
+            );
+        }
+
+        let block_mapping: HashMap<usize, usize> = lookup
+            .block_ids
+            .iter()
+            .enumerate()
+            .map(|(src_idx, dst_block)| (src_idx, *dst_block))
+            .collect();
+
+        for (layer_idx, layer_payload) in payload.layers.iter().enumerate() {
+            let (dst_key_cache, dst_value_cache) = kv_cache
+                .get_mut(layer_idx)
+                .ok_or_else(|| candle_core::Error::msg("Invalid cache layer index"))?;
+
+            validate_import_shape("key", layer_idx, &layer_payload.key_shape, dst_key_cache)?;
+            validate_import_shape(
+                "value",
+                layer_idx,
+                &layer_payload.value_shape,
+                dst_value_cache,
+            )?;
+
+            let key_src = bytes_to_tensor(
+                &layer_payload.key_bytes,
+                &layer_payload.key_shape,
+                dst_key_cache.dtype(),
+            )?;
+            let value_src = bytes_to_tensor(
+                &layer_payload.value_bytes,
+                &layer_payload.value_shape,
+                dst_value_cache.dtype(),
+            )?;
+
+            swap_blocks_into(key_src, dst_key_cache, block_mapping.clone())?;
+            swap_blocks_into(value_src, dst_value_cache, block_mapping.clone())?;
+        }
+
+        Ok(())
+    }
+
+    pub fn release_session(&mut self, request_id: &str) -> bool {
+        self.scheduler.abort_session_by_request_id(request_id)
+    }
+}
+
+fn gather_blocks(cache: &Tensor, block_ids: &[usize]) -> Result<Tensor> {
+    if block_ids.is_empty() {
+        candle_core::bail!("No block ids available to gather KV cache");
+    }
+    if block_ids.len() == 1 {
+        return cache.narrow(0, block_ids[0], 1);
+    }
+    let mut parts = Vec::with_capacity(block_ids.len());
+    for block_id in block_ids {
+        parts.push(cache.narrow(0, *block_id, 1)?);
+    }
+    Tensor::cat(&parts, 0)
+}
+
+fn tensor_to_bytes(tensor: &Tensor) -> Result<Vec<u8>> {
+    let cpu = tensor.to_device(&Device::Cpu)?;
+    let flat = cpu.flatten_all()?;
+    let bytes = match flat.dtype() {
+        DType::F32 => flat
+            .to_vec1::<f32>()?
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect(),
+        DType::F16 => flat
+            .to_vec1::<f16>()?
+            .into_iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect(),
+        DType::BF16 => flat
+            .to_vec1::<bf16>()?
+            .into_iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect(),
+        DType::U8 => flat.to_vec1::<u8>()?,
+        dtype => {
+            candle_core::bail!("Unsupported KV dtype for export: {dtype:?}");
+        }
+    };
+    Ok(bytes)
+}
+
+fn bytes_to_tensor(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Tensor> {
+    match dtype {
+        DType::F32 => {
+            if bytes.len() % 4 != 0 {
+                candle_core::bail!("Invalid f32 byte length {}", bytes.len());
+            }
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape.to_vec(), &Device::Cpu)
+        }
+        DType::F16 => {
+            if bytes.len() % 2 != 0 {
+                candle_core::bail!("Invalid f16 byte length {}", bytes.len());
+            }
+            let values = bytes
+                .chunks_exact(2)
+                .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape.to_vec(), &Device::Cpu)
+        }
+        DType::BF16 => {
+            if bytes.len() % 2 != 0 {
+                candle_core::bail!("Invalid bf16 byte length {}", bytes.len());
+            }
+            let values = bytes
+                .chunks_exact(2)
+                .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape.to_vec(), &Device::Cpu)
+        }
+        DType::U8 => Tensor::from_vec(bytes.to_vec(), shape.to_vec(), &Device::Cpu),
+        other => candle_core::bail!("Unsupported KV dtype for import: {other:?}"),
+    }
+}
+
+fn validate_import_shape(
+    kind: &str,
+    layer_idx: usize,
+    import_shape: &[usize],
+    dst_cache: &Tensor,
+) -> Result<()> {
+    let dst_dims = dst_cache.dims();
+    if import_shape.len() != dst_dims.len() {
+        candle_core::bail!(
+            "Invalid {kind} shape rank at layer {}: imported={:?} expected={:?}",
+            layer_idx,
+            import_shape,
+            dst_dims
+        );
+    }
+    if import_shape.is_empty() {
+        candle_core::bail!("Invalid empty {kind} shape at layer {}", layer_idx);
+    }
+    if import_shape[0] == 0 {
+        candle_core::bail!(
+            "Invalid imported {kind} with zero blocks at layer {}",
+            layer_idx
+        );
+    }
+    if import_shape[1..] != dst_dims[1..] {
+        candle_core::bail!(
+            "Incompatible {kind} shape at layer {}: imported={:?} target={:?}",
+            layer_idx,
+            import_shape,
+            dst_dims
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn swap_blocks_into(
+    src: Tensor,
+    dst: &mut Tensor,
+    block_mapping: HashMap<usize, usize>,
+) -> Result<()> {
+    crate::backend::swap_blocks(src, &*dst, block_mapping)
+}
+
+#[cfg(not(feature = "metal"))]
+fn swap_blocks_into(
+    src: Tensor,
+    dst: &mut Tensor,
+    block_mapping: HashMap<usize, usize>,
+) -> Result<()> {
+    crate::backend::swap_blocks(src, dst, block_mapping)
 }

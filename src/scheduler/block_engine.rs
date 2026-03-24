@@ -633,6 +633,7 @@ mod tests {
             EmbeddingType::Last,
             None,
             None,
+            None,
         );
         (group, seq)
     }

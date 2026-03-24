@@ -15,6 +15,7 @@ pub mod distributed;
 pub mod lora;
 pub mod requests;
 pub mod responses;
+pub mod runtime_internal;
 pub mod sampling_params;
 pub mod streaming;
 use either::Either;
@@ -101,6 +102,7 @@ pub struct TaskData {
     pub encoding_format: requests::EncodingFormat,
     pub embedding_type: requests::EmbeddingType,
     pub adapter_id: Option<String>,
+    pub adapter_timeline: Option<Vec<requests::HybrieAdapterStep>>,
 }
 
 pub mod conversation;

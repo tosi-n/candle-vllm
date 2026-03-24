@@ -133,6 +133,10 @@ impl _Sequence {
         dref.prompt_token_ids.len() + dref.output_token_ids.len()
     }
 
+    pub fn get_output_len(&self) -> usize {
+        self.deref().output_token_ids.len()
+    }
+
     pub fn get_token_ids(&self) -> Vec<u32> {
         let mut res = self.deref().prompt_token_ids.clone();
         res.extend(
@@ -281,6 +285,7 @@ pub struct SequenceGroup {
     pub encoding_format: crate::openai::requests::EncodingFormat,
     pub embedding_type: crate::openai::requests::EmbeddingType,
     pub adapter_id: Option<String>,
+    pub adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
     pub sender: Option<Sender<ChatResponse>>,
     // Tool call and reasoning tracking
     pub accumulated_output: String,
@@ -304,6 +309,7 @@ impl SequenceGroup {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
+        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
         sender: Option<Sender<ChatResponse>>,
     ) -> Self {
         let mut seq_map = HashMap::new();
@@ -322,6 +328,7 @@ impl SequenceGroup {
             encoding_format,
             embedding_type,
             adapter_id,
+            adapter_timeline,
             sender,
             accumulated_output: "".to_string(),
             tool_call_state: ToolCallState::Normal,
@@ -392,5 +399,122 @@ impl SequenceGroup {
 
     pub fn adapter_id(&self) -> Option<&str> {
         self.adapter_id.as_deref()
+    }
+
+    pub fn resolve_decode_adapter_id(&self) -> Option<String> {
+        let Some(timeline) = self.adapter_timeline.as_ref() else {
+            return self.adapter_id.clone();
+        };
+        if timeline.is_empty() {
+            return self.adapter_id.clone();
+        }
+
+        let step = self
+            .seqs
+            .values()
+            .next()
+            .map(|seq| seq.deref().get_output_len())
+            .unwrap_or(0);
+
+        let mut selected = self.adapter_id.clone();
+        for event in timeline {
+            if event.start_step <= step {
+                selected = Some(event.adapter_id.clone());
+            } else {
+                break;
+            }
+        }
+        selected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::sampling_params::{EarlyStoppingCondition, SamplingParams};
+
+    #[test]
+    fn resolve_decode_adapter_id_switches_at_step_boundaries() {
+        let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
+            &vec![1, 2, 3],
+            42,
+            16,
+        ))));
+        let sampling_params = SamplingParams::new(
+            1,
+            None,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1.0,
+            EarlyStoppingCondition::UnlikelyBetterCandidates,
+            None,
+            vec![],
+            false,
+            16,
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("sampling params");
+        let group = SequenceGroup::new(
+            &[seq.clone()],
+            0,
+            1,
+            "req-1".to_string(),
+            SystemTime::now(),
+            sampling_params,
+            false,
+            false,
+            crate::openai::requests::EncodingFormat::Float,
+            crate::openai::requests::EmbeddingType::Last,
+            Some("base".to_string()),
+            Some(vec![
+                crate::openai::requests::HybrieAdapterStep {
+                    start_step: 0,
+                    adapter_id: "planner".to_string(),
+                },
+                crate::openai::requests::HybrieAdapterStep {
+                    start_step: 2,
+                    adapter_id: "verifier".to_string(),
+                },
+            ]),
+            None,
+        );
+
+        assert_eq!(
+            group.resolve_decode_adapter_id().as_deref(),
+            Some("planner")
+        );
+
+        seq.deref_mut()
+            .add_token(crate::openai::sampling_params::Logprobs {
+                token: 5,
+                logprob: 0.0,
+                bytes: "a".to_string(),
+                top_logprobs: Vec::new(),
+            });
+        assert_eq!(
+            group.resolve_decode_adapter_id().as_deref(),
+            Some("planner")
+        );
+
+        seq.deref_mut()
+            .add_token(crate::openai::sampling_params::Logprobs {
+                token: 6,
+                logprob: 0.0,
+                bytes: "b".to_string(),
+                top_logprobs: Vec::new(),
+            });
+        assert_eq!(
+            group.resolve_decode_adapter_id().as_deref(),
+            Some("verifier")
+        );
     }
 }

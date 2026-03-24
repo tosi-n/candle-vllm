@@ -881,13 +881,7 @@ impl LoRAManager {
             return Ok(());
         };
 
-        let expected_norm = normalize_model_id(expected);
-        let adapter_norm = normalize_model_id(adapter_base_model);
-
-        if expected_norm == adapter_norm
-            || expected_norm.contains(&adapter_norm)
-            || adapter_norm.contains(&expected_norm)
-        {
+        if model_ids_compatible(expected, adapter_base_model) {
             return Ok(());
         }
 
@@ -1268,13 +1262,46 @@ fn normalize_module_name(name: &str) -> String {
 }
 
 fn normalize_model_id(model_id: &str) -> String {
-    model_id
-        .trim()
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_id)
-        .to_lowercase()
+    let raw = model_id.trim().trim_end_matches('/');
+    let tail = raw.rsplit('/').next().unwrap_or(raw).to_ascii_lowercase();
+    let mut normalized = String::with_capacity(tail.len());
+    let mut prev_dash = false;
+    for ch in tail.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch
+        } else if ch == '_' || ch == '.' || ch == '-' {
+            '-'
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !prev_dash {
+                normalized.push(mapped);
+            }
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+            normalized.push(mapped);
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn normalize_model_family(model_id: &str) -> String {
+    let mut family = normalize_model_id(model_id);
+    for suffix in ["-instruct", "-chat"] {
+        if family.ends_with(suffix) {
+            family.truncate(family.len() - suffix.len());
+            break;
+        }
+    }
+    family
+}
+
+fn model_ids_compatible(expected: &str, candidate: &str) -> bool {
+    let expected = normalize_model_family(expected);
+    let candidate = normalize_model_family(candidate);
+    expected == candidate || expected.contains(&candidate) || candidate.contains(&expected)
 }
 
 static GLOBAL_LORA_MANAGER: OnceLock<Arc<LoRAManager>> = OnceLock::new();
@@ -1649,5 +1676,21 @@ mod tests {
             AdapterLoadState::Failed
         );
         assert_eq!(manager.get("good").unwrap().state, AdapterLoadState::Loaded);
+    }
+
+    #[test]
+    fn model_id_normalization_handles_qwen35_family_aliases() {
+        assert!(super::model_ids_compatible(
+            "Qwen/Qwen3.5-9B-Instruct",
+            "qwen3_5-9b"
+        ));
+        assert!(super::model_ids_compatible(
+            "qwen/qwen3_5.9b",
+            "Qwen3.5-9B-Instruct"
+        ));
+        assert!(!super::model_ids_compatible(
+            "qwen3.5-9b",
+            "llama3.1-8b-instruct"
+        ));
     }
 }

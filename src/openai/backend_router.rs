@@ -870,17 +870,45 @@ fn ewma(current: f64, latest: f64) -> f64 {
 }
 
 fn normalize_model_id(value: &str) -> String {
-    value
-        .trim()
-        .to_lowercase()
-        .replace(" ", "")
-        .replace('_', "-")
-        .replace('/', "-")
+    let raw = value.trim().trim_end_matches('/');
+    let tail = raw.rsplit('/').next().unwrap_or(raw).to_ascii_lowercase();
+    let mut normalized = String::with_capacity(tail.len());
+    let mut prev_dash = false;
+    for ch in tail.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch
+        } else if ch == '_' || ch == '.' || ch == '-' {
+            '-'
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !prev_dash {
+                normalized.push(mapped);
+            }
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+            normalized.push(mapped);
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn normalize_model_family(value: &str) -> String {
+    let mut family = normalize_model_id(value);
+    for suffix in ["-instruct", "-chat"] {
+        if family.ends_with(suffix) {
+            family.truncate(family.len() - suffix.len());
+            break;
+        }
+    }
+    family
 }
 
 fn model_ids_compatible(local: &str, remote: &str) -> bool {
-    let local = normalize_model_id(local);
-    let remote = normalize_model_id(remote);
+    let local = normalize_model_family(local);
+    let remote = normalize_model_family(remote);
     local == remote || local.contains(&remote) || remote.contains(&local)
 }
 
@@ -994,6 +1022,10 @@ mod tests {
         assert!(super::model_ids_compatible(
             "org/qwen3-4b-instruct",
             "qwen3_4b"
+        ));
+        assert!(super::model_ids_compatible(
+            "Qwen/Qwen3.5-9B-Instruct",
+            "qwen3_5-9b"
         ));
         assert!(!super::model_ids_compatible("qwen3-4b", "llama3-8b"));
     }
