@@ -311,6 +311,8 @@ async fn main() -> Result<()> {
         args.model_id,
         args.weight_path,
         args.weight_file,
+        None,
+        None,
     ));
 
     let (paths, gguf) = loader.prepare_model_weights(args.hf_token, args.hf_token_path)?;

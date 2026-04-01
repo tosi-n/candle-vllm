@@ -12,6 +12,8 @@ use candle_core::{
     Device, IndexOp, Result, Storage, Tensor,
 };
 use std::collections::HashMap;
+#[cfg(feature = "metal")]
+use std::iter::zip;
 #[cfg(feature = "cuda")]
 use std::iter::zip;
 
@@ -55,8 +57,8 @@ pub unsafe fn copy_blocks(
     let mut dtype = DType::F32;
 
     for (key_cache, value_cache) in zip(&key_caches, &value_caches) {
-        key_cache.to_device(cache_dev)?;
-        value_cache.to_device(cache_dev)?;
+        let _: Tensor = key_cache.to_device(cache_dev)?;
+        let _: Tensor = value_cache.to_device(cache_dev)?;
 
         let key_offset: u64 = key_cache
             .storage_and_layout()

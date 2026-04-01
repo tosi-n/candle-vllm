@@ -88,6 +88,7 @@ metal = ["candle-core/metal", "candle-nn/metal", "dep:metal", "attention-rs/meta
 cudnn = ["candle-core/cudnn"]
 flashattn = ["attention-rs/flashattn", "attention-rs/no-fp8-kvcache"]
 flashinfer = ["attention-rs/flashinfer"]
+flash-decoding = []
 mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl"]
 nccl = ["candle-core/nccl"]
 mpi = ["candle-core/nccl", "dep:mpi"]

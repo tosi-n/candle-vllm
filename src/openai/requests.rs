@@ -53,7 +53,7 @@ pub enum Messages {
     Literal(String),
 }
 
-fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
+pub fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
     match content {
         Some(MessageContentType::PureText(text)) => text.clone(),
         Some(MessageContentType::Single(item)) => match item {
@@ -70,6 +70,10 @@ fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
             .join(" "),
         None => String::new(),
     }
+}
+
+pub fn extract_text_from_required_content(content: &MessageContentType) -> String {
+    extract_text_from_content(Some(content))
 }
 
 pub fn normalize_empty_openai_tool_results(messages: &mut [ChatMessage]) {
