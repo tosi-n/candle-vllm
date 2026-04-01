@@ -12,6 +12,7 @@ pub mod backend_router;
 #[cfg(feature = "nccl")]
 pub mod communicator;
 pub mod distributed;
+pub mod embedded_runtime;
 pub mod lora;
 pub mod requests;
 pub mod responses;

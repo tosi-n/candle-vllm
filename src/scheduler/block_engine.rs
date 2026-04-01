@@ -634,6 +634,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         (group, seq)
     }

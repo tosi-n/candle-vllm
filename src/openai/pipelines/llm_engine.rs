@@ -19,7 +19,7 @@ use crate::{
     },
     scheduler::{
         cache_engine::{CacheConfig, CacheEngine},
-        sequence::{Sequence, SequenceGroup, _Sequence},
+        sequence::{InteractiveSessionControl, Sequence, SequenceGroup, _Sequence},
         SchedulerConfig, SchedulerOutput,
     },
     InputMetadata,
@@ -63,11 +63,21 @@ pub struct KvLayerPayload {
 pub struct KvSessionPayload {
     pub session_id: String,
     pub seq_id: usize,
+    pub prompt_ids: Vec<u32>,
     pub prompt_len: usize,
     pub total_len: usize,
     pub adapter_id: Option<String>,
     pub block_ids: Vec<usize>,
     pub layers: Vec<KvLayerPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractiveSessionSnapshot {
+    pub session_id: String,
+    pub prompt_ids: Vec<u32>,
+    pub adapter_id: Option<String>,
+    pub sampling_params: SamplingParams,
+    pub kv_payload: KvSessionPayload,
 }
 
 const _PAD_SLOT_ID: i64 = -1;
@@ -85,6 +95,7 @@ pub struct LLMEngine {
     pub sync_notifies: HashMap<String, Option<Arc<Notify>>>,
     pub senders: HashMap<String, Option<Arc<Sender<ChatResponse>>>>,
     pub completion_records: HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>,
+    interactive_sessions: HashMap<String, Arc<InteractiveSessionControl>>,
     sequence_groups: RwLock<VecDeque<Arc<SequenceGroup>>>,
     multi_process: bool,
     num_shards: usize,
@@ -147,6 +158,7 @@ impl LLMEngine {
             group_id: 0,
             notify: notify.clone(),
             completion_records: HashMap::new(),
+            interactive_sessions: HashMap::new(),
             sequence_groups: RwLock::new(VecDeque::new()),
             multi_process,
             num_shards,
@@ -291,6 +303,7 @@ impl LLMEngine {
                             task.adapter_id.clone(),
                             task.adapter_timeline.clone(),
                             None,
+                            None,
                         );
                         tracing::debug!("Daemon process: add_sequence to group {}", task.group_id);
                         self.scheduler.add_sequence(seq_group);
@@ -335,6 +348,7 @@ impl LLMEngine {
                     task.embedding_type.clone(),
                     task.adapter_id.clone(),
                     task.adapter_timeline.clone(),
+                    None,
                     sender,
                 );
                 tracing::debug!("Main process: add_sequence to group {}", task.group_id);
@@ -514,6 +528,9 @@ impl LLMEngine {
                 let scheduler_outputs = e.scheduler.schedule();
                 if !scheduler_outputs.ignored_seq_groups.is_empty() {
                     for group in scheduler_outputs.ignored_seq_groups.iter() {
+                        if let Some(control) = group.interactive_control() {
+                            control.publish_error("Ignored sequence group: allocation impossible");
+                        }
                         if let Some(sender) = &group.sender {
                             let _ = sender.send(ChatResponse::ModelError(
                                 candle_core::Error::msg(
@@ -546,11 +563,14 @@ impl LLMEngine {
             let mut adapter_batches = Vec::<VecDeque<Arc<SequenceGroup>>>::new();
             let mut adapter_batch_map = HashMap::<Option<String>, usize>::new();
             for group in &scheduled {
+                if group.is_decode_blocked() {
+                    continue;
+                }
                 let is_prompt_group = group
                     .get_seqs()
                     .values()
                     .next()
-                    .map(|seq| seq.deref().is_prompt())
+                    .map(|seq| seq.deref().needs_prefill())
                     .unwrap_or(true);
                 let adapter_key = if is_prompt_group {
                     group.adapter_id.clone()
@@ -585,6 +605,41 @@ impl LLMEngine {
                     continue;
                 }
 
+                let mut prompt_import_only = VecDeque::new();
+                batch_groups.retain(|group| {
+                    let needs_prefill = group
+                        .get_seqs()
+                        .values()
+                        .next()
+                        .map(|seq| seq.deref().needs_prefill())
+                        .unwrap_or(false);
+                    let is_import_only = group
+                        .interactive_control()
+                        .as_ref()
+                        .is_some_and(|control| control.is_import_only());
+                    if needs_prefill && is_import_only {
+                        prompt_import_only.push_back(group.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                for group in prompt_import_only {
+                    if let Some(seq) = group.get_seqs().values().next() {
+                        let prompt_len = seq.deref().get_prompt_len();
+                        seq.deref_mut().set_num_cached_tokens(prompt_len);
+                    }
+                    if let Some(control) = group.interactive_control() {
+                        control.clear_import_only();
+                        control.publish_prefill_ready();
+                    }
+                }
+
+                if batch_groups.is_empty() {
+                    continue;
+                }
+
                 let selected_adapter_id = batch_groups[0].adapter_id.clone();
                 crate::openai::lora::set_active_adapter(selected_adapter_id.clone());
                 let forward_result = (|| -> Result<(Tensor, bool, String)> {
@@ -597,7 +652,7 @@ impl LLMEngine {
                         tokens,
                         positions,
                         metadata,
-                    } = if seqs.values().nth(0).unwrap().deref().is_prompt() {
+                    } = if seqs.values().nth(0).unwrap().deref().needs_prefill() {
                         e.prepare_prompt(&batch_groups, device)
                     } else {
                         e.prepare_decode(&batch_groups, device)
@@ -625,7 +680,9 @@ impl LLMEngine {
                 let (mut logits, is_prompt, model_name) = forward_result?;
 
                 if let Some(adapter_id) = selected_adapter_id.as_deref() {
-                    if let Some(manager) = crate::openai::lora::global_lora_manager() {
+                    if let Some(manager) =
+                        crate::openai::lora::global_lora_manager_for_adapter(adapter_id)
+                    {
                         manager.touch_usage(adapter_id);
                     }
                 }
@@ -718,6 +775,23 @@ impl LLMEngine {
                             0,
                         )?;
                     }
+
+                    for group in &batch_groups {
+                        if let Some(seq) = group.get_seqs().values().next() {
+                            let prompt_len = seq.deref().get_prompt_len();
+                            seq.deref_mut().set_num_cached_tokens(prompt_len);
+                        }
+                    }
+
+                    batch_groups.retain(|group| {
+                        if let Some(control) = group.interactive_control() {
+                            if control.decode_budget() == 0 {
+                                control.publish_prefill_ready();
+                                return false;
+                            }
+                        }
+                        true
+                    });
                 }
 
                 if batch_groups.is_empty() {
@@ -912,6 +986,10 @@ impl LLMEngine {
                                 }
                             }
                         };
+                        if let Some(control) = group.interactive_control() {
+                            control.consume_decode_step();
+                            control.publish_token(logprobs.token);
+                        }
                         seq.deref_mut().add_token(logprobs);
                     }
                     Either::Right(finish_reason) => {
@@ -1019,6 +1097,10 @@ impl LLMEngine {
                                 }
                             }
                         };
+                        if let Some(control) = group.interactive_control() {
+                            control.consume_decode_step();
+                            control.publish_finished();
+                        }
                         seq.deref_mut().set_finish_reason(finish_reason);
                     }
                 }
@@ -1609,6 +1691,7 @@ impl LLMEngine {
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
         adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        interactive_control: Option<Arc<InteractiveSessionControl>>,
         sender: Option<Sender<ChatResponse>>,
     ) -> SequenceGroup {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
@@ -1629,8 +1712,59 @@ impl LLMEngine {
             embedding_type,
             adapter_id,
             adapter_timeline,
+            interactive_control,
             sender,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_interactive_request(
+        &mut self,
+        prompt: Vec<u32>,
+        request_id: String,
+        created: SystemTime,
+        sampling_params: SamplingParams,
+        use_logprobs: bool,
+        is_embedding: bool,
+        encoding_format: crate::openai::requests::EncodingFormat,
+        embedding_type: crate::openai::requests::EmbeddingType,
+        adapter_id: Option<String>,
+        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        interactive_control: Arc<InteractiveSessionControl>,
+    ) {
+        let seq_group = self.create_sequence_group(
+            self.seq_id,
+            self.group_id,
+            &prompt,
+            &request_id,
+            created,
+            &sampling_params,
+            use_logprobs,
+            is_embedding,
+            encoding_format,
+            embedding_type,
+            adapter_id,
+            adapter_timeline,
+            Some(interactive_control.clone()),
+            None,
+        );
+        self.scheduler.add_sequence(seq_group);
+        self.interactive_sessions
+            .insert(request_id, interactive_control);
+        self.seq_id += 1;
+        self.group_id += 1;
+    }
+
+    pub fn interactive_control(&self, request_id: &str) -> Option<Arc<InteractiveSessionControl>> {
+        self.interactive_sessions.get(request_id).cloned()
+    }
+
+    pub fn grant_decode_steps(&mut self, request_id: &str, steps: usize) -> bool {
+        if let Some(control) = self.interactive_sessions.get(request_id) {
+            control.grant_decode_steps(steps);
+            return true;
+        }
+        false
     }
 
     pub fn add_request(
@@ -1729,11 +1863,31 @@ impl LLMEngine {
         Ok(Some(KvSessionPayload {
             session_id: lookup.request_id,
             seq_id: lookup.seq_id,
+            prompt_ids: lookup.prompt_ids,
             prompt_len: lookup.prompt_len,
             total_len: lookup.total_len,
             adapter_id: lookup.adapter_id,
             block_ids: lookup.block_ids,
             layers,
+        }))
+    }
+
+    pub fn export_interactive_session_snapshot(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<InteractiveSessionSnapshot>> {
+        let Some(lookup) = self.scheduler.lookup_session(request_id) else {
+            return Ok(None);
+        };
+        let Some(kv_payload) = self.export_session_payload(request_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(InteractiveSessionSnapshot {
+            session_id: lookup.request_id,
+            prompt_ids: lookup.prompt_ids,
+            adapter_id: lookup.adapter_id,
+            sampling_params: lookup.sampling_params,
+            kv_payload,
         }))
     }
 
@@ -1807,6 +1961,7 @@ impl LLMEngine {
     }
 
     pub fn release_session(&mut self, request_id: &str) -> bool {
+        self.interactive_sessions.remove(request_id);
         self.scheduler.abort_session_by_request_id(request_id)
     }
 }

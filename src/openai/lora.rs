@@ -1304,18 +1304,35 @@ fn model_ids_compatible(expected: &str, candidate: &str) -> bool {
     expected == candidate || expected.contains(&candidate) || candidate.contains(&expected)
 }
 
-static GLOBAL_LORA_MANAGER: OnceLock<Arc<LoRAManager>> = OnceLock::new();
+static GLOBAL_LORA_MANAGERS: OnceLock<RwLock<Vec<Arc<LoRAManager>>>> = OnceLock::new();
 
 thread_local! {
     static ACTIVE_ADAPTER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 pub fn set_global_lora_manager(manager: Arc<LoRAManager>) {
-    let _ = GLOBAL_LORA_MANAGER.set(manager);
+    let registry = GLOBAL_LORA_MANAGERS.get_or_init(|| RwLock::new(Vec::new()));
+    let mut managers = registry.write();
+    if managers.iter().any(|existing| Arc::ptr_eq(existing, &manager)) {
+        return;
+    }
+    managers.push(manager);
 }
 
 pub fn global_lora_manager() -> Option<Arc<LoRAManager>> {
-    GLOBAL_LORA_MANAGER.get().cloned()
+    GLOBAL_LORA_MANAGERS
+        .get()
+        .and_then(|registry| registry.read().first().cloned())
+}
+
+pub fn global_lora_manager_for_adapter(adapter_id: &str) -> Option<Arc<LoRAManager>> {
+    GLOBAL_LORA_MANAGERS.get().and_then(|registry| {
+        registry
+            .read()
+            .iter()
+            .find(|manager| manager.get(adapter_id).is_some())
+            .cloned()
+    })
 }
 
 pub fn set_active_adapter(adapter_id: Option<String>) {
@@ -1341,7 +1358,8 @@ pub fn compute_active_lora_delta(
     let Some(adapter_id) = active_adapter_id() else {
         return Ok(None);
     };
-    let Some(manager) = global_lora_manager() else {
+    let Some(manager) = global_lora_manager_for_adapter(&adapter_id).or_else(global_lora_manager)
+    else {
         return Ok(None);
     };
     manager.compute_delta(&adapter_id, module_name, x, out_dtype, shard)

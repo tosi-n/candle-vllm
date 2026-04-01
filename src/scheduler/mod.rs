@@ -43,9 +43,11 @@ pub struct SchedulerOutput {
 pub struct SessionLookup {
     pub request_id: String,
     pub seq_id: usize,
+    pub prompt_ids: Vec<u32>,
     pub prompt_len: usize,
     pub total_len: usize,
     pub adapter_id: Option<String>,
+    pub sampling_params: crate::openai::sampling_params::SamplingParams,
     pub block_ids: Vec<usize>,
 }
 
@@ -168,6 +170,10 @@ impl Scheduler {
         let mut preempted = VecDeque::new();
         while !self.running.is_empty() {
             let seq_group = self.running.pop_front().unwrap();
+            if seq_group.is_decode_blocked() {
+                running.push_back(seq_group);
+                continue;
+            }
             let mut finished_with_break = false;
             while !self.block_engine.can_append_token_to_seq(&seq_group) {
                 // If we cannot, now we need to preempt some seqs
@@ -296,9 +302,11 @@ impl Scheduler {
                 return Some(SessionLookup {
                     request_id: group.request_id.clone(),
                     seq_id,
+                    prompt_ids: seq_guard.get_token_ids(),
                     prompt_len: seq_guard.get_prompt_len(),
                     total_len: seq_guard.get_len(),
                     adapter_id: group.adapter_id.clone(),
+                    sampling_params: group.sampling_params.clone(),
                     block_ids,
                 });
             }
