@@ -4,33 +4,21 @@ use super::responses::{APIError, ChatCompletionResponse, ChatResponder};
 use super::sampling_params::{EarlyStoppingCondition, SamplingParams};
 use super::streaming::{ChatResponse, Streamer, StreamingStatus};
 use super::OpenAIServerData;
-use crate::openai::backend_router::{
-    BackendOperationResult, CloudAdapterGetResult, CloudAdapterListResult,
-    CloudBackendStatusSnapshot, RoutingMode, SelectedBackend,
-};
-use crate::openai::lora::{
-    AdapterRecord, AdapterStatusResponse, LoadAdapterRequest, RegisterAdapterRequest,
-    UnloadAdapterRequest,
-};
+use crate::openai::lora::{LoadAdapterRequest, RegisterAdapterRequest, UnloadAdapterRequest};
 use crate::openai::{resolve_tools_for_request, ResolvedToolConfig};
 use crate::tools::ToolFormat;
-use axum::body::Body;
 use axum::response::sse::KeepAlive;
 use axum::{
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse},
     Json,
 };
-use bytes::Bytes;
 use flume;
-use futures::Stream;
 use serde_json::json;
 use std::env;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 use tracing::debug;
@@ -176,84 +164,9 @@ async fn check_length(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutionMode {
-    Cloud,
-    Local,
-    Hybrid,
-}
-
-impl ExecutionMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Cloud => "cloud",
-            Self::Local => "local",
-            Self::Hybrid => "hybrid",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_lowercase().as_str() {
-            "cloud" => Some(Self::Cloud),
-            "local" => Some(Self::Local),
-            "hybrid" => Some(Self::Hybrid),
-            _ => None,
-        }
-    }
-}
-
-fn parse_execution_mode(
-    headers: &HeaderMap,
-    model: Option<&str>,
-    runtime_local_only_strict: bool,
-) -> Result<ExecutionMode, APIError> {
-    if let Some(mode) = headers
-        .get("x-hybrie-execution-mode")
-        .and_then(|value| value.to_str().ok())
-    {
-        let selected = ExecutionMode::parse(mode).ok_or_else(|| {
-            APIError::new(format!(
-                "Invalid x-hybrie-execution-mode '{}'. Expected cloud|local|hybrid.",
-                mode
-            ))
-        })?;
-        if runtime_local_only_strict && selected != ExecutionMode::Local {
-            return Err(APIError::new(
-                "Runtime is configured as local-only strict. x-hybrie-execution-mode must be 'local' or omitted.".to_string(),
-            ));
-        }
-        return Ok(selected);
-    }
-
-    if let Some(model) = model {
-        if model.starts_with("cloud/") {
-            if runtime_local_only_strict {
-                return Err(APIError::new(
-                    "Runtime is configured as local-only strict. Model prefix 'cloud/' is not allowed."
-                        .to_string(),
-                ));
-            }
-            return Ok(ExecutionMode::Cloud);
-        }
-        if model.starts_with("local/") {
-            return Ok(ExecutionMode::Local);
-        }
-        if model.starts_with("hybrid/") {
-            if runtime_local_only_strict {
-                return Err(APIError::new(
-                    "Runtime is configured as local-only strict. Model prefix 'hybrid/' is not allowed."
-                        .to_string(),
-                ));
-            }
-            return Ok(ExecutionMode::Hybrid);
-        }
-    }
-
-    Ok(ExecutionMode::Local)
-}
-
 fn parse_adapter_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {
     if let Some(adapter_id) = headers
-        .get("x-hybrie-adapter-id")
+        .get("x-runtime-adapter-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -264,199 +177,40 @@ fn parse_adapter_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Opt
     request
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.hybrie.as_ref())
-        .and_then(|hybrie| hybrie.adapter_id.clone())
+        .and_then(|metadata| metadata.runtime.as_ref())
+        .and_then(|runtime| runtime.adapter_id.clone())
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
 }
 
-fn parse_adapter_timeline(
+fn parse_adapter_schedule(
     request: &ChatCompletionRequest,
-) -> Option<Vec<crate::openai::requests::HybrieAdapterStep>> {
-    let mut timeline = request
+) -> Option<Vec<crate::openai::requests::AdapterScheduleStep>> {
+    let mut schedule = request
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.hybrie.as_ref())
-        .and_then(|hybrie| hybrie.adapter_timeline.clone())?;
+        .and_then(|metadata| metadata.runtime.as_ref())
+        .and_then(|runtime| runtime.adapter_schedule.clone())?;
 
-    timeline.retain(|step| !step.adapter_id.trim().is_empty());
-    if timeline.is_empty() {
+    schedule.retain(|step| !step.adapter_id.trim().is_empty());
+    if schedule.is_empty() {
         return None;
     }
 
-    timeline.sort_by_key(|step| step.start_step);
-    for step in &mut timeline {
+    schedule.sort_by_key(|step| step.start_step);
+    for step in &mut schedule {
         step.adapter_id = step.adapter_id.trim().to_string();
     }
-    Some(timeline)
+    Some(schedule)
 }
 
 fn parse_session_id(headers: &HeaderMap) -> Option<String> {
     headers
-        .get("x-hybrie-session-id")
+        .get("x-runtime-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
-}
-
-fn strip_mode_prefix(model: Option<String>) -> Option<String> {
-    model.map(|model_id| {
-        for prefix in ["local/", "cloud/", "hybrid/"] {
-            if let Some(stripped) = model_id.strip_prefix(prefix) {
-                return stripped.to_string();
-            }
-        }
-        model_id
-    })
-}
-
-fn execution_mode_to_routing_mode(mode: ExecutionMode) -> RoutingMode {
-    match mode {
-        ExecutionMode::Local => RoutingMode::LocalOnly,
-        ExecutionMode::Cloud => RoutingMode::CloudOnly,
-        ExecutionMode::Hybrid => RoutingMode::Hybrid,
-    }
-}
-
-fn with_hybrie_headers(
-    mut response: Response,
-    mode: ExecutionMode,
-    backend: &str,
-    adapter_id: Option<&str>,
-) -> Response {
-    let selected_mode =
-        HeaderValue::from_str(mode.as_str()).unwrap_or_else(|_| HeaderValue::from_static("local"));
-    response
-        .headers_mut()
-        .insert("x-hybrie-selected-mode", selected_mode);
-
-    let selected_backend =
-        HeaderValue::from_str(backend).unwrap_or_else(|_| HeaderValue::from_static("local"));
-    response
-        .headers_mut()
-        .insert("x-hybrie-selected-backend", selected_backend);
-
-    let adapter_header = HeaderValue::from_str(adapter_id.unwrap_or("none"))
-        .unwrap_or_else(|_| HeaderValue::from_static("none"));
-    response
-        .headers_mut()
-        .insert("x-hybrie-adapter-id", adapter_header);
-
-    response
-}
-
-struct MeteredLocalStreamer {
-    inner: Streamer,
-    router: Arc<crate::openai::backend_router::BackendRouter>,
-    started: Instant,
-    done: bool,
-}
-
-impl MeteredLocalStreamer {
-    fn new(
-        inner: Streamer,
-        router: Arc<crate::openai::backend_router::BackendRouter>,
-        started: Instant,
-    ) -> Self {
-        Self {
-            inner,
-            router,
-            started,
-            done: false,
-        }
-    }
-
-    fn finish_once(&mut self, success: bool) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        self.router.end_local_request(self.started, success);
-    }
-}
-
-impl Stream for MeteredLocalStreamer {
-    type Item = Result<axum::response::sse::Event, axum::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(None) => {
-                self.finish_once(true);
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for MeteredLocalStreamer {
-    fn drop(&mut self) {
-        self.finish_once(true);
-    }
-}
-
-struct MeteredCloudByteStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    router: Arc<crate::openai::backend_router::BackendRouter>,
-    backend_id: String,
-    started: Instant,
-    done: bool,
-}
-
-impl MeteredCloudByteStream {
-    fn new(
-        inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-        router: Arc<crate::openai::backend_router::BackendRouter>,
-        backend_id: String,
-        started: Instant,
-    ) -> Self {
-        Self {
-            inner,
-            router,
-            backend_id,
-            started,
-            done: false,
-        }
-    }
-
-    fn finish_once(&mut self, success: bool) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        self.router
-            .end_cloud_request(&self.backend_id, self.started, success);
-    }
-}
-
-impl Stream for MeteredCloudByteStream {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
-            Poll::Ready(Some(Err(err))) => {
-                self.finish_once(false);
-                Poll::Ready(Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    err.to_string(),
-                ))))
-            }
-            Poll::Ready(None) => {
-                self.finish_once(true);
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for MeteredCloudByteStream {
-    fn drop(&mut self) {
-        self.finish_once(true);
-    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -464,10 +218,6 @@ pub struct WarmupAdaptersRequest {
     pub adapter_ids: Vec<String>,
     #[serde(default)]
     pub wait: bool,
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -478,214 +228,18 @@ pub struct WarmupAdaptersResponse {
     pub failed: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-pub struct AdapterQuery {
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub backend: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdapterScope {
-    Local,
-    Cloud,
-    All,
-}
-
-fn parse_adapter_scope(
-    raw: Option<&str>,
-    runtime_local_only_strict: bool,
-) -> Result<AdapterScope, APIError> {
+fn ensure_local_adapter_scope(raw: Option<&str>) -> Result<(), APIError> {
     let Some(raw) = raw else {
-        return Ok(AdapterScope::Local);
+        return Ok(());
     };
-    let scope = match raw.trim().to_lowercase().as_str() {
-        "local" => Ok(AdapterScope::Local),
-        "cloud" => Ok(AdapterScope::Cloud),
-        "all" => Ok(AdapterScope::All),
-        other => Err(APIError::new(format!(
-            "Invalid adapter scope '{}'. Expected local|cloud|all.",
-            other
-        ))),
-    }?;
-    if runtime_local_only_strict && scope != AdapterScope::Local {
-        return Err(APIError::new(
-            "Runtime is configured as local-only strict. Adapter scope must be 'local' or omitted."
-                .to_string(),
-        ));
+    let scope = raw.trim().to_lowercase();
+    if scope.is_empty() || scope == "local" {
+        return Ok(());
     }
-    Ok(scope)
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct AdapterStatusEnvelope {
-    local: AdapterStatusResponse,
-    cloud: Vec<CloudBackendStatusSnapshot>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct AdapterOperationEnvelope {
-    adapter_id: String,
-    scope: String,
-    local: Option<AdapterRecord>,
-    cloud: Vec<BackendOperationResult>,
-    errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct AdapterListEnvelope {
-    scope: String,
-    local: Option<Vec<AdapterRecord>>,
-    cloud: Vec<CloudAdapterListResult>,
-    errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct AdapterLookupEnvelope {
-    adapter_id: String,
-    scope: String,
-    local: Option<AdapterRecord>,
-    cloud: Vec<CloudAdapterGetResult>,
-    errors: Vec<String>,
-}
-
-async fn proxy_chat_completion_to_cloud(
-    data: Arc<OpenAIServerData>,
-    headers: &HeaderMap,
-    request: &ChatCompletionRequest,
-    selected_mode: ExecutionMode,
-    backend_id: &str,
-    adapter_id: Option<&str>,
-) -> ChatResponder {
-    let backend = match data.backend_router.get_cloud_backend(backend_id) {
-        Some(backend) => backend,
-        None => {
-            return ChatResponder::ValidationError(APIError::new(format!(
-                "Unknown cloud backend '{}'",
-                backend_id
-            )));
-        }
-    };
-
-    let mut outbound_request = request.clone();
-    outbound_request.model = strip_mode_prefix(outbound_request.model.clone());
-
-    let url = format!("{}/v1/chat/completions", backend.base_url);
-    let started = Instant::now();
-    data.backend_router.begin_cloud_request(&backend.id);
-
-    let mut req_builder = data
-        .backend_router
-        .client()
-        .post(url)
-        .header("x-hybrie-execution-mode", "local")
-        .json(&outbound_request);
-    if let Some(adapter_id) = adapter_id {
-        req_builder = req_builder.header("x-hybrie-adapter-id", adapter_id);
-    }
-    if let Some(auth) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    {
-        req_builder = req_builder.header(axum::http::header::AUTHORIZATION.as_str(), auth);
-    }
-    if let Some(session_id) = headers
-        .get("x-hybrie-session-id")
-        .and_then(|value| value.to_str().ok())
-    {
-        req_builder = req_builder.header("x-hybrie-session-id", session_id);
-    }
-
-    let response = match req_builder.send().await {
-        Ok(response) => response,
-        Err(err) => {
-            data.backend_router
-                .end_cloud_request(&backend.id, started, false);
-            return ChatResponder::ModelError(APIError::new(format!(
-                "Cloud backend '{}' request failed: {}",
-                backend.id, err
-            )));
-        }
-    };
-
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut response_builder = Response::builder().status(status);
-    if let Some(content_type) = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    {
-        response_builder = response_builder.header(axum::http::header::CONTENT_TYPE, content_type);
-    }
-    if let Some(cache_control) = response
-        .headers()
-        .get(axum::http::header::CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
-    {
-        response_builder =
-            response_builder.header(axum::http::header::CACHE_CONTROL, cache_control);
-    }
-
-    let is_stream = request.stream.unwrap_or(false);
-    if is_stream {
-        let stream = MeteredCloudByteStream::new(
-            Box::pin(response.bytes_stream()),
-            Arc::clone(&data.backend_router),
-            backend.id.clone(),
-            started,
-        );
-        let raw = match response_builder.body(Body::from_stream(stream)) {
-            Ok(raw) => raw,
-            Err(err) => {
-                data.backend_router
-                    .end_cloud_request(&backend.id, started, false);
-                return ChatResponder::InternalError(APIError::new(format!(
-                    "Failed to build cloud stream response: {}",
-                    err
-                )));
-            }
-        };
-        return ChatResponder::Raw(with_hybrie_headers(
-            raw,
-            selected_mode,
-            backend.id.as_str(),
-            adapter_id,
-        ));
-    }
-
-    let is_success = status.is_success();
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(err) => {
-            data.backend_router
-                .end_cloud_request(&backend.id, started, false);
-            return ChatResponder::InternalError(APIError::new(format!(
-                "Failed to read cloud response body: {}",
-                err
-            )));
-        }
-    };
-    data.backend_router
-        .end_cloud_request(&backend.id, started, is_success);
-
-    let raw = match response_builder.body(Body::from(body)) {
-        Ok(raw) => raw,
-        Err(err) => {
-            return ChatResponder::InternalError(APIError::new(format!(
-                "Failed to build cloud response: {}",
-                err
-            )));
-        }
-    };
-
-    ChatResponder::Raw(with_hybrie_headers(
-        raw,
-        selected_mode,
-        backend.id.as_str(),
-        adapter_id,
-    ))
+    Err(APIError::new(format!(
+        "Invalid adapter scope '{}'. This runtime only supports local adapter operations.",
+        raw
+    )))
 }
 
 #[utoipa::path(
@@ -717,95 +271,26 @@ pub async fn chat_completions(
         ));
     }
 
-    let selected_mode = match parse_execution_mode(
-        &headers,
-        request.model.as_deref(),
-        data.runtime_local_only_strict,
-    ) {
-        Ok(mode) => mode,
-        Err(e) => return ChatResponder::ValidationError(e),
-    };
-
     let session_id = parse_session_id(&headers);
     let mut adapter_id = parse_adapter_id(&headers, &request);
-    let adapter_timeline = parse_adapter_timeline(&request);
+    let adapter_schedule = parse_adapter_schedule(&request);
     if adapter_id.is_none() {
         if let Some(session_id) = session_id.as_ref() {
-            adapter_id = data.sticky_adapters.read().get(session_id).cloned();
+            adapter_id = data.session_adapters.read().get(session_id).cloned();
         }
     }
     if let (Some(session_id), Some(adapter_id)) = (session_id.as_ref(), adapter_id.as_ref()) {
-        data.sticky_adapters
+        data.session_adapters
             .write()
             .insert(session_id.clone(), adapter_id.clone());
     }
-
-    let routing_mode = execution_mode_to_routing_mode(selected_mode);
-    let local_status = data.lora_manager.status();
-    let selected_backend = match data
-        .backend_router
-        .select_backend(routing_mode, adapter_id.as_deref(), &local_status)
-        .await
-    {
-        Ok(backend) => backend,
-        Err(err) => return ChatResponder::ValidationError(err),
-    };
-
-    if selected_mode == ExecutionMode::Hybrid {
-        if let Some(adapter) = adapter_id.as_deref() {
-            let router = Arc::clone(&data.backend_router);
-            let adapter_id = adapter.to_string();
-            let selected_cloud = selected_backend.cloud_id().map(str::to_string);
-            tokio::spawn(async move {
-                router
-                    .maybe_autosync_cloud_adapter(&adapter_id, selected_cloud.as_deref())
-                    .await;
-            });
-        }
-    }
-
     if let Some(adapter) = adapter_id.as_deref() {
-        match &selected_backend {
-            SelectedBackend::Local => {
-                if let Err(err) = data.lora_manager.ensure_loaded_async(adapter).await {
-                    return ChatResponder::ValidationError(APIError::new(format!(
-                        "Failed to prepare adapter '{}': {}",
-                        adapter, err
-                    )));
-                }
-            }
-            SelectedBackend::Cloud(_) => {
-                if selected_mode == ExecutionMode::Hybrid {
-                    if let Ok((_, should_start)) = data.lora_manager.enqueue_load(adapter, None) {
-                        if should_start {
-                            let manager = Arc::clone(&data.lora_manager);
-                            let adapter_id = adapter.to_string();
-                            tokio::spawn(async move {
-                                if let Err(err) = manager.load_async(&adapter_id, None).await {
-                                    tracing::warn!(
-                                        "Background local load failed for adapter '{}': {}",
-                                        adapter_id,
-                                        err
-                                    );
-                                }
-                            });
-                        }
-                    }
-                }
-            }
+        if let Err(err) = data.lora_manager.ensure_loaded_async(adapter).await {
+            return ChatResponder::ValidationError(APIError::new(format!(
+                "Failed to prepare adapter '{}': {}",
+                adapter, err
+            )));
         }
-    }
-
-    if let SelectedBackend::Cloud(backend_id) = &selected_backend {
-        return proxy_chat_completion_to_cloud(
-            data,
-            &headers,
-            &request,
-            selected_mode,
-            backend_id,
-            adapter_id.as_deref(),
-        )
-        .await;
     }
 
     let tool_config = match resolve_tools_for_request(
@@ -897,7 +382,10 @@ pub async fn chat_completions(
     let data_clone = data.clone();
     let request_id_clone = request_id.clone();
     let stream_request = request.stream.is_some_and(|x| x);
-    let model_name = strip_mode_prefix(request.model.clone()).unwrap_or("default".to_string());
+    let model_name = request
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let request_logprobs = request.logprobs.unwrap_or(false);
     let sync_notify = Arc::new(Notify::new());
     let sync_completion_notify = if stream_request {
@@ -907,9 +395,7 @@ pub async fn chat_completions(
     };
     let data_for_engine = data.clone();
     let adapter_id_for_engine = adapter_id.clone();
-    let adapter_timeline_for_engine = adapter_timeline.clone();
-    let local_started = Instant::now();
-    data.backend_router.begin_local_request();
+    let adapter_schedule_for_engine = adapter_schedule.clone();
 
     let _ = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(async move {
@@ -926,7 +412,7 @@ pub async fn chat_completions(
                     EncodingFormat::default(),
                     EmbeddingType::default(),
                     adapter_id_for_engine,
-                    adapter_timeline_for_engine,
+                    adapter_schedule_for_engine,
                     if stream_request {
                         Some(Arc::new(response_tx))
                     } else {
@@ -940,31 +426,21 @@ pub async fn chat_completions(
     });
 
     if stream_request {
-        let metered_streamer = MeteredLocalStreamer::new(
-            Streamer {
-                rx,
-                status: StreamingStatus::Uninitialized,
-            },
-            Arc::clone(&data.backend_router),
-            local_started,
-        );
-        let response = Sse::new(metered_streamer)
-            .keep_alive(
-                KeepAlive::new()
-                    .interval(Duration::from_millis(
-                        env::var("KEEP_ALIVE_INTERVAL")
-                            .map(|val| val.parse::<u64>().unwrap_or(100))
-                            .unwrap_or(100),
-                    ))
-                    .text("keep-alive-text"),
-            )
-            .into_response();
-        ChatResponder::Raw(with_hybrie_headers(
-            response,
-            selected_mode,
-            "local",
-            adapter_id.as_deref(),
-        ))
+        let response = Sse::new(Streamer {
+            rx,
+            status: StreamingStatus::Uninitialized,
+        })
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_millis(
+                    env::var("KEEP_ALIVE_INTERVAL")
+                        .map(|val| val.parse::<u64>().unwrap_or(100))
+                        .unwrap_or(100),
+                ))
+                .text("keep-alive-text"),
+        )
+        .into_response();
+        ChatResponder::Raw(response)
     } else {
         // wait until current response finished
         tracing::warn!("waiting response for sync request {}", request_id_clone);
@@ -974,7 +450,6 @@ pub async fn chat_completions(
         let (choices, usage) = {
             let model = data_clone.model.read();
             if !model.completion_records.contains_key(&request_id_clone) {
-                data.backend_router.end_local_request(local_started, false);
                 return ChatResponder::ModelError(APIError::from(format!(
                     "Unable to generate response for request {request_id_clone}"
                 )));
@@ -1011,13 +486,7 @@ pub async fn chat_completions(
             usage: usage,
         })
         .into_response();
-        data.backend_router.end_local_request(local_started, true);
-        ChatResponder::Raw(with_hybrie_headers(
-            response,
-            selected_mode,
-            "local",
-            adapter_id.as_deref(),
-        ))
+        ChatResponder::Raw(response)
     }
 }
 
@@ -1144,76 +613,24 @@ pub async fn register_adapter(
     State(data): State<Arc<OpenAIServerData>>,
     request: Json<RegisterAdapterRequest>,
 ) -> Response {
-    let request = request.0;
-    let scope = match parse_adapter_scope(request.scope.as_deref(), data.runtime_local_only_strict)
-    {
-        Ok(scope) => scope,
-        Err(err) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response()
-        }
-    };
-
-    if scope == AdapterScope::Local {
-        let mut local_request = request.clone();
-        local_request.scope = None;
-        local_request.backend = None;
-        return match data.lora_manager.register(local_request) {
-            Ok(record) => (StatusCode::OK, Json(record)).into_response(),
-            Err(err) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response(),
-        };
+    let mut request = request.0;
+    if let Err(err) = ensure_local_adapter_scope(request.scope.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
     }
-
-    let mut local = None;
-    let mut errors = Vec::new();
-
-    if scope == AdapterScope::All {
-        let mut local_request = request.clone();
-        local_request.scope = None;
-        local_request.backend = None;
-        match data.lora_manager.register(local_request) {
-            Ok(record) => local = Some(record),
-            Err(err) => errors.push(format!("local: {}", err)),
-        }
+    request.scope = None;
+    request.backend = None;
+    match data.lora_manager.register(request) {
+        Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+        Err(err) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
     }
-
-    let cloud = data
-        .backend_router
-        .register_adapter_on_cloud(&request, request.backend.as_deref())
-        .await;
-    for result in &cloud {
-        if !result.ok {
-            errors.push(format!("{}: {}", result.backend_id, result.message));
-        }
-    }
-
-    let status = if errors.is_empty() {
-        StatusCode::OK
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
-    };
-    (
-        status,
-        Json(AdapterOperationEnvelope {
-            adapter_id: request.id,
-            scope: match scope {
-                AdapterScope::Local => "local".to_string(),
-                AdapterScope::Cloud => "cloud".to_string(),
-                AdapterScope::All => "all".to_string(),
-            },
-            local,
-            cloud,
-            errors,
-        }),
-    )
-        .into_response()
 }
 
 #[utoipa::path(
@@ -1222,63 +639,8 @@ pub async fn register_adapter(
     path = "/v1/adapters",
     responses((status = 200, description = "List adapters"))
 )]
-pub async fn list_adapters(
-    State(data): State<Arc<OpenAIServerData>>,
-    Query(query): Query<AdapterQuery>,
-) -> Response {
-    let scope = match parse_adapter_scope(query.scope.as_deref(), data.runtime_local_only_strict) {
-        Ok(scope) => scope,
-        Err(err) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response()
-        }
-    };
-
-    if scope == AdapterScope::Local {
-        return (StatusCode::OK, Json(data.lora_manager.list())).into_response();
-    }
-
-    let local = if scope == AdapterScope::All {
-        Some(data.lora_manager.list())
-    } else {
-        None
-    };
-    let cloud = data
-        .backend_router
-        .list_adapters_on_cloud(query.backend.as_deref())
-        .await;
-    let errors = cloud
-        .iter()
-        .filter_map(|result| {
-            result
-                .error
-                .as_ref()
-                .map(|err| format!("{}: {}", result.backend_id, err))
-        })
-        .collect::<Vec<_>>();
-    let status = if errors.is_empty() {
-        StatusCode::OK
-    } else {
-        StatusCode::PARTIAL_CONTENT
-    };
-
-    (
-        status,
-        Json(AdapterListEnvelope {
-            scope: match scope {
-                AdapterScope::Local => "local".to_string(),
-                AdapterScope::Cloud => "cloud".to_string(),
-                AdapterScope::All => "all".to_string(),
-            },
-            local,
-            cloud,
-            errors,
-        }),
-    )
-        .into_response()
+pub async fn list_adapters(State(data): State<Arc<OpenAIServerData>>) -> Response {
+    (StatusCode::OK, Json(data.lora_manager.list())).into_response()
 }
 
 #[utoipa::path(
@@ -1291,74 +653,15 @@ pub async fn list_adapters(
 pub async fn get_adapter(
     State(data): State<Arc<OpenAIServerData>>,
     Path(id): Path<String>,
-    Query(query): Query<AdapterQuery>,
 ) -> Response {
-    let scope = match parse_adapter_scope(query.scope.as_deref(), data.runtime_local_only_strict) {
-        Ok(scope) => scope,
-        Err(err) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response()
-        }
-    };
-
-    if scope == AdapterScope::Local {
-        return match data.lora_manager.get(&id) {
-            Some(record) => (StatusCode::OK, Json(record)).into_response(),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": format!("Adapter '{}' not found", id) })),
-            )
-                .into_response(),
-        };
+    match data.lora_manager.get(&id) {
+        Some(record) => (StatusCode::OK, Json(record)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Adapter '{}' not found", id) })),
+        )
+            .into_response(),
     }
-
-    let local = if scope == AdapterScope::All {
-        data.lora_manager.get(&id)
-    } else {
-        None
-    };
-    let cloud = data
-        .backend_router
-        .get_adapter_on_cloud(&id, query.backend.as_deref())
-        .await;
-    let errors = cloud
-        .iter()
-        .filter_map(|result| {
-            result
-                .error
-                .as_ref()
-                .map(|err| format!("{}: {}", result.backend_id, err))
-        })
-        .collect::<Vec<_>>();
-    let any_found = local.is_some() || cloud.iter().any(|result| result.adapter.is_some());
-    let status = if any_found {
-        if errors.is_empty() {
-            StatusCode::OK
-        } else {
-            StatusCode::PARTIAL_CONTENT
-        }
-    } else {
-        StatusCode::NOT_FOUND
-    };
-
-    (
-        status,
-        Json(AdapterLookupEnvelope {
-            adapter_id: id,
-            scope: match scope {
-                AdapterScope::Local => "local".to_string(),
-                AdapterScope::Cloud => "cloud".to_string(),
-                AdapterScope::All => "all".to_string(),
-            },
-            local,
-            cloud,
-            errors,
-        }),
-    )
-        .into_response()
 }
 
 #[utoipa::path(
@@ -1375,122 +678,53 @@ pub async fn load_adapter(
     request: Option<Json<LoadAdapterRequest>>,
 ) -> Response {
     let request = request.map(|json| json.0).unwrap_or_default();
-    let scope = match parse_adapter_scope(request.scope.as_deref(), data.runtime_local_only_strict)
-    {
-        Ok(scope) => scope,
+    if let Err(err) = ensure_local_adapter_scope(request.scope.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let pin_override = request.pinned;
+    let wait = request.wait.unwrap_or(false);
+
+    if wait {
+        return match data.lora_manager.load_async(&id, pin_override).await {
+            Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+            Err(err) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response(),
+        };
+    }
+
+    let (record, should_start) = match data.lora_manager.enqueue_load(&id, pin_override) {
+        Ok(v) => v,
         Err(err) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({ "error": err.to_string() })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
-    let pin_override = request.pinned;
-    let wait = request.wait.unwrap_or(false);
-
-    if scope == AdapterScope::Local {
-        if wait {
-            return match data.lora_manager.load_async(&id, pin_override).await {
-                Ok(record) => (StatusCode::OK, Json(record)).into_response(),
-                Err(err) => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({ "error": err.to_string() })),
-                )
-                    .into_response(),
-            };
-        }
-
-        let (record, should_start) = match data.lora_manager.enqueue_load(&id, pin_override) {
-            Ok(v) => v,
-            Err(err) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({ "error": err.to_string() })),
-                )
-                    .into_response();
+    if should_start {
+        let manager = Arc::clone(&data.lora_manager);
+        let id_for_task = id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = manager.load_async(&id_for_task, None).await {
+                tracing::warn!(
+                    "Background LoRA load failed for adapter '{}': {}",
+                    id_for_task,
+                    err
+                );
             }
-        };
-
-        if should_start {
-            let manager = Arc::clone(&data.lora_manager);
-            let id_for_task = id.clone();
-            tokio::spawn(async move {
-                if let Err(err) = manager.load_async(&id_for_task, None).await {
-                    tracing::warn!(
-                        "Background LoRA load failed for adapter '{}': {}",
-                        id_for_task,
-                        err
-                    );
-                }
-            });
-        }
-        return (StatusCode::ACCEPTED, Json(record)).into_response();
+        });
     }
-
-    let mut local = None;
-    let mut errors = Vec::new();
-
-    if scope == AdapterScope::All {
-        if wait {
-            match data.lora_manager.load_async(&id, pin_override).await {
-                Ok(record) => local = Some(record),
-                Err(err) => errors.push(format!("local: {}", err)),
-            }
-        } else {
-            match data.lora_manager.enqueue_load(&id, pin_override) {
-                Ok((record, should_start)) => {
-                    local = Some(record);
-                    if should_start {
-                        let manager = Arc::clone(&data.lora_manager);
-                        let id_for_task = id.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = manager.load_async(&id_for_task, None).await {
-                                tracing::warn!(
-                                    "Background LoRA load failed for adapter '{}': {}",
-                                    id_for_task,
-                                    err
-                                );
-                            }
-                        });
-                    }
-                }
-                Err(err) => errors.push(format!("local: {}", err)),
-            }
-        }
-    }
-
-    let cloud = data
-        .backend_router
-        .load_adapter_on_cloud(&id, pin_override, wait, request.backend.as_deref())
-        .await;
-    for result in &cloud {
-        if !result.ok {
-            errors.push(format!("{}: {}", result.backend_id, result.message));
-        }
-    }
-
-    let status = if errors.is_empty() {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
-    };
-    (
-        status,
-        Json(AdapterOperationEnvelope {
-            adapter_id: id,
-            scope: match scope {
-                AdapterScope::Local => "local".to_string(),
-                AdapterScope::Cloud => "cloud".to_string(),
-                AdapterScope::All => "all".to_string(),
-            },
-            local,
-            cloud,
-            errors,
-        }),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(record)).into_response()
 }
 
 #[utoipa::path(
@@ -1506,71 +740,22 @@ pub async fn unload_adapter(
     request: Option<Json<UnloadAdapterRequest>>,
 ) -> Response {
     let request = request.map(|json| json.0).unwrap_or_default();
-    let scope = match parse_adapter_scope(request.scope.as_deref(), data.runtime_local_only_strict)
-    {
-        Ok(scope) => scope,
-        Err(err) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response()
-        }
-    };
-
-    if scope == AdapterScope::Local {
-        return match data.lora_manager.unload(&id) {
-            Ok(record) => (StatusCode::OK, Json(record)).into_response(),
-            Err(err) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response(),
-        };
+    if let Err(err) = ensure_local_adapter_scope(request.scope.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
     }
 
-    let local = if scope == AdapterScope::All {
-        match data.lora_manager.unload(&id) {
-            Ok(record) => Some(record),
-            Err(err) => {
-                tracing::warn!("Local adapter unload failed for '{}': {}", id, err);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let cloud = data
-        .backend_router
-        .unload_adapter_on_cloud(&id, request.backend.as_deref())
-        .await;
-    let errors = cloud
-        .iter()
-        .filter(|result| !result.ok)
-        .map(|result| format!("{}: {}", result.backend_id, result.message))
-        .collect::<Vec<_>>();
-
-    let status = if errors.is_empty() {
-        StatusCode::OK
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
-    };
-    (
-        status,
-        Json(AdapterOperationEnvelope {
-            adapter_id: id,
-            scope: match scope {
-                AdapterScope::Local => "local".to_string(),
-                AdapterScope::Cloud => "cloud".to_string(),
-                AdapterScope::All => "all".to_string(),
-            },
-            local,
-            cloud,
-            errors,
-        }),
-    )
-        .into_response()
+    match data.lora_manager.unload(&id) {
+        Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+        Err(err) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[utoipa::path(
@@ -1580,13 +765,7 @@ pub async fn unload_adapter(
     responses((status = 200, description = "Adapter status"))
 )]
 pub async fn adapters_status(State(data): State<Arc<OpenAIServerData>>) -> Response {
-    let local = data.lora_manager.status();
-    let cloud = if data.runtime_local_only_strict {
-        Vec::new()
-    } else {
-        data.backend_router.cloud_status_snapshots().await
-    };
-    (StatusCode::OK, Json(AdapterStatusEnvelope { local, cloud })).into_response()
+    (StatusCode::OK, Json(data.lora_manager.status())).into_response()
 }
 
 #[utoipa::path(
@@ -1600,18 +779,6 @@ pub async fn warmup_adapters(
     State(data): State<Arc<OpenAIServerData>>,
     request: Json<WarmupAdaptersRequest>,
 ) -> Response {
-    let scope = match parse_adapter_scope(request.scope.as_deref(), data.runtime_local_only_strict)
-    {
-        Ok(scope) => scope,
-        Err(err) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response()
-        }
-    };
-
     let mut queued = 0usize;
     let mut loaded = 0usize;
     let mut failed = Vec::new();
@@ -1622,53 +789,26 @@ pub async fn warmup_adapters(
             continue;
         }
 
-        if scope == AdapterScope::Local || scope == AdapterScope::All {
-            if request.wait {
-                match data.lora_manager.load_async(adapter_id, None).await {
-                    Ok(_) => loaded += 1,
-                    Err(err) => failed.push(format!("local/{adapter_id}: {err}")),
-                }
-            } else {
-                match data.lora_manager.enqueue_load(adapter_id, None) {
-                    Ok((_, should_start)) => {
-                        queued += 1;
-                        if should_start {
-                            let manager = Arc::clone(&data.lora_manager);
-                            let id = adapter_id.to_string();
-                            tokio::spawn(async move {
-                                if let Err(err) = manager.load_async(&id, None).await {
-                                    tracing::warn!(
-                                        "Warmup load failed for adapter '{}': {}",
-                                        id,
-                                        err
-                                    );
-                                }
-                            });
-                        }
-                    }
-                    Err(err) => failed.push(format!("local/{adapter_id}: {err}")),
-                }
+        if request.wait {
+            match data.lora_manager.load_async(adapter_id, None).await {
+                Ok(_) => loaded += 1,
+                Err(err) => failed.push(format!("local/{adapter_id}: {err}")),
             }
-        }
-
-        if scope == AdapterScope::Cloud || scope == AdapterScope::All {
-            let outcomes = data
-                .backend_router
-                .load_adapter_on_cloud(adapter_id, None, request.wait, request.backend.as_deref())
-                .await;
-            for result in outcomes {
-                if result.ok {
-                    if request.wait {
-                        loaded += 1;
-                    } else {
-                        queued += 1;
+        } else {
+            match data.lora_manager.enqueue_load(adapter_id, None) {
+                Ok((_, should_start)) => {
+                    queued += 1;
+                    if should_start {
+                        let manager = Arc::clone(&data.lora_manager);
+                        let id = adapter_id.to_string();
+                        tokio::spawn(async move {
+                            if let Err(err) = manager.load_async(&id, None).await {
+                                tracing::warn!("Warmup load failed for adapter '{}': {}", id, err);
+                            }
+                        });
                     }
-                } else {
-                    failed.push(format!(
-                        "cloud/{}/{}: {}",
-                        result.backend_id, adapter_id, result.message
-                    ));
                 }
+                Err(err) => failed.push(format!("local/{adapter_id}: {err}")),
             }
         }
     }
@@ -1690,58 +830,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn execution_mode_rejects_cloud_header_in_strict_runtime() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-hybrie-execution-mode", HeaderValue::from_static("cloud"));
-        let err = parse_execution_mode(&headers, None, true).expect_err("cloud should be rejected");
-        assert!(err.to_string().contains("local-only strict"));
+    fn adapter_scope_accepts_local_or_empty() {
+        assert!(ensure_local_adapter_scope(None).is_ok());
+        assert!(ensure_local_adapter_scope(Some("local")).is_ok());
+        assert!(ensure_local_adapter_scope(Some("")).is_ok());
     }
 
     #[test]
-    fn execution_mode_accepts_cloud_header_when_not_strict() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-hybrie-execution-mode", HeaderValue::from_static("cloud"));
-        let mode = parse_execution_mode(&headers, None, false).expect("cloud should be accepted");
-        assert_eq!(mode, ExecutionMode::Cloud);
+    fn adapter_scope_rejects_non_local_values() {
+        let err = ensure_local_adapter_scope(Some("cloud")).expect_err("cloud scope should fail");
+        assert!(err.to_string().contains("only supports local"));
     }
 
     #[test]
-    fn execution_mode_rejects_hybrid_prefix_in_strict_runtime() {
-        let headers = HeaderMap::new();
-        let err = parse_execution_mode(&headers, Some("hybrid/qwen"), true)
-            .expect_err("hybrid prefix should be rejected");
-        assert!(err.to_string().contains("local-only strict"));
-    }
-
-    #[test]
-    fn adapter_scope_rejects_cloud_in_strict_runtime() {
-        let err =
-            parse_adapter_scope(Some("cloud"), true).expect_err("cloud scope should be rejected");
-        assert!(err.to_string().contains("local-only strict"));
-    }
-
-    #[test]
-    fn adapter_scope_defaults_to_local() {
-        let scope = parse_adapter_scope(None, true).expect("default scope should parse");
-        assert_eq!(scope, AdapterScope::Local);
-    }
-
-    #[test]
-    fn adapter_timeline_is_sorted_and_trimmed() {
+    fn adapter_schedule_is_sorted_and_trimmed() {
         let request = ChatCompletionRequest {
             metadata: Some(crate::openai::requests::ChatCompletionMetadata {
-                hybrie: Some(crate::openai::requests::HybrieMetadata {
+                runtime: Some(crate::openai::requests::RuntimeRequestMetadata {
                     adapter_id: Some("base".to_string()),
-                    adapter_timeline: Some(vec![
-                        crate::openai::requests::HybrieAdapterStep {
+                    adapter_schedule: Some(vec![
+                        crate::openai::requests::AdapterScheduleStep {
                             start_step: 10,
                             adapter_id: "  role_b ".to_string(),
                         },
-                        crate::openai::requests::HybrieAdapterStep {
+                        crate::openai::requests::AdapterScheduleStep {
                             start_step: 2,
                             adapter_id: "role_a".to_string(),
                         },
-                        crate::openai::requests::HybrieAdapterStep {
+                        crate::openai::requests::AdapterScheduleStep {
                             start_step: 12,
                             adapter_id: " ".to_string(),
                         },
@@ -1751,11 +867,11 @@ mod tests {
             ..ChatCompletionRequest::default()
         };
 
-        let timeline = parse_adapter_timeline(&request).expect("timeline should parse");
-        assert_eq!(timeline.len(), 2);
-        assert_eq!(timeline[0].start_step, 2);
-        assert_eq!(timeline[0].adapter_id, "role_a");
-        assert_eq!(timeline[1].start_step, 10);
-        assert_eq!(timeline[1].adapter_id, "role_b");
+        let schedule = parse_adapter_schedule(&request).expect("schedule should parse");
+        assert_eq!(schedule.len(), 2);
+        assert_eq!(schedule[0].start_step, 2);
+        assert_eq!(schedule[0].adapter_id, "role_a");
+        assert_eq!(schedule[1].start_step, 10);
+        assert_eq!(schedule[1].adapter_id, "role_b");
     }
 }

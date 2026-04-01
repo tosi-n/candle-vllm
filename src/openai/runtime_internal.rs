@@ -11,7 +11,7 @@ use crate::openai::lora::{AdapterLoadState, LoRAManager};
 use crate::openai::pipelines::llm_engine::{KvSessionPayload, LLMEngine};
 
 pub mod proto {
-    tonic::include_proto!("hybrie.runtime.v1");
+    tonic::include_proto!("candle.vllm.runtime.v1");
 }
 
 use proto::runtime_internal_server::RuntimeInternal;

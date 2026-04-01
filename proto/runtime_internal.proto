@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package hybrie.runtime.v1;
+package candle.vllm.runtime.v1;
 
 message SessionCompatibilityMetadata {
   string model_id = 1;

@@ -1,6 +1,6 @@
-# Runtime Internal API (HybrIE KV Handoff + Adapter Runtime Ops)
+# Runtime Internal API
 
-This document covers the runtime-node internal interface used by HybrIE orchestration.
+This document covers the generic internal runtime interface for session/KV handoff and adapter runtime operations.
 
 ## Scope Boundary
 
@@ -8,16 +8,14 @@ This document covers the runtime-node internal interface used by HybrIE orchestr
   - Executes local inference.
   - Owns scheduler/KV cache/adapter runtime.
   - Exposes internal gRPC for KV/session and adapter runtime operations.
-- HybrIE control plane:
-  - Chooses mode/stage (`local|cloud|hybrid`).
-  - Coordinates prefill/decode split and KV handoff.
+- External orchestrators can use this API to coordinate session handoff, adapter lifecycle, and runtime compatibility checks.
 
 ## CLI Flags
 
 Runtime boundary and internal API flags:
 
 - `--runtime-local-only-strict` (default: `true`)
-  - Public API only accepts local mode (rejects `cloud` and `hybrid`).
+  - Preserves a local-only public runtime boundary.
 - `--runtime-internal-api` (default: `false`)
   - Enables internal gRPC server for KV handoff and adapter runtime ops.
 - `--runtime-internal-grpc-host` (default: `127.0.0.1`)
@@ -59,13 +57,12 @@ candle-vllm \
   - `max_active_loras`
   - `loaded_loras`
   - `lora_mode`
-  - execution mode visibility based on strict boundary.
-
+  
 ## Internal gRPC Service
 
-Proto: [`proto/hybrie_runtime.proto`](../proto/hybrie_runtime.proto)
+Proto: [`proto/runtime_internal.proto`](../proto/runtime_internal.proto)
 
-Service: `hybrie.runtime.v1.RuntimeInternal`
+Service: `candle.vllm.runtime.v1.RuntimeInternal`
 
 Methods:
 
@@ -89,19 +86,19 @@ Methods:
 
 On failure, runtime releases the target session (`fail-fast` behavior).
 
-## Chain-of-LoRA Step Timeline (Request Metadata)
+## Adapter Step Scheduling (Request Metadata)
 
 Runtime supports decode step-level adapter switching via:
 
-- request header adapter (existing): `x-hybrie-adapter-id`
-- request body metadata timeline:
+- request header adapter (existing): `x-runtime-adapter-id`
+- request body metadata schedule:
 
 ```json
 {
   "metadata": {
-    "hybrie": {
+    "runtime": {
       "adapter_id": "adapter_planner_router_v1",
-      "adapter_timeline": [
+      "adapter_schedule": [
         { "start_step": 0, "adapter_id": "adapter_planner_router_v1" },
         { "start_step": 64, "adapter_id": "adapter_answerer_domain_v1" },
         { "start_step": 128, "adapter_id": "adapter_verifier_quality_v1" }

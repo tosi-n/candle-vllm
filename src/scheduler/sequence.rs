@@ -400,7 +400,7 @@ pub struct SequenceGroup {
     pub encoding_format: crate::openai::requests::EncodingFormat,
     pub embedding_type: crate::openai::requests::EmbeddingType,
     pub adapter_id: Option<String>,
-    pub adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+    pub adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
     pub sender: Option<Sender<ChatResponse>>,
     pub interactive_control: Option<Arc<InteractiveSessionControl>>,
     // Tool call and reasoning tracking
@@ -425,7 +425,7 @@ impl SequenceGroup {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
-        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
         interactive_control: Option<Arc<InteractiveSessionControl>>,
         sender: Option<Sender<ChatResponse>>,
     ) -> Self {
@@ -445,7 +445,7 @@ impl SequenceGroup {
             encoding_format,
             embedding_type,
             adapter_id,
-            adapter_timeline,
+            adapter_schedule,
             sender,
             interactive_control,
             accumulated_output: "".to_string(),
@@ -534,7 +534,7 @@ impl SequenceGroup {
     }
 
     pub fn resolve_decode_adapter_id(&self) -> Option<String> {
-        let Some(timeline) = self.adapter_timeline.as_ref() else {
+        let Some(timeline) = self.adapter_schedule.as_ref() else {
             return self.adapter_id.clone();
         };
         if timeline.is_empty() {
@@ -609,11 +609,11 @@ mod tests {
             crate::openai::requests::EmbeddingType::Last,
             Some("base".to_string()),
             Some(vec![
-                crate::openai::requests::HybrieAdapterStep {
+                crate::openai::requests::AdapterScheduleStep {
                     start_step: 0,
                     adapter_id: "planner".to_string(),
                 },
-                crate::openai::requests::HybrieAdapterStep {
+                crate::openai::requests::AdapterScheduleStep {
                     start_step: 2,
                     adapter_id: "verifier".to_string(),
                 },
@@ -671,8 +671,14 @@ mod tests {
                 control.next_event().await,
                 InteractiveSessionEvent::PrefillReady
             );
-            assert_eq!(control.next_event().await, InteractiveSessionEvent::Token(42));
-            assert_eq!(control.next_event().await, InteractiveSessionEvent::Finished);
+            assert_eq!(
+                control.next_event().await,
+                InteractiveSessionEvent::Token(42)
+            );
+            assert_eq!(
+                control.next_event().await,
+                InteractiveSessionEvent::Finished
+            );
         });
     }
 }

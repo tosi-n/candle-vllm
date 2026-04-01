@@ -5,10 +5,10 @@ use crate::{
 };
 use candle_core::Device;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokenizers::{EncodeInput, Encoding, Tokenizer};
-pub mod backend_router;
 #[cfg(feature = "nccl")]
 pub mod communicator;
 pub mod distributed;
@@ -119,8 +119,7 @@ pub struct OpenAIServerData {
     pub runtime_local_only_strict: bool,
     pub mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
     pub lora_manager: Arc<lora::LoRAManager>,
-    pub backend_router: Arc<backend_router::BackendRouter>,
-    pub sticky_adapters: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub session_adapters: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -139,7 +138,7 @@ pub struct TaskData {
     pub images: Option<multimodal::ImageData>,
     pub include_usage: bool,
     pub adapter_id: Option<String>,
-    pub adapter_timeline: Option<Vec<requests::HybrieAdapterStep>>,
+    pub adapter_schedule: Option<Vec<requests::AdapterScheduleStep>>,
 }
 
 pub mod conversation;

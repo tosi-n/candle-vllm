@@ -7,7 +7,6 @@ use axum::{
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "nccl")]
 use candle_vllm::backend::heartbeat;
-use candle_vllm::openai::backend_router::{BackendRouter, CloudBackendConfig};
 use candle_vllm::openai::models::Config;
 use candle_vllm::openai::openai_server::{
     adapters_status, chat_completions, create_embeddings, get_adapter, list_adapters, load_adapter,
@@ -30,7 +29,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Notify;
 use tonic::transport::Server;
 use tower_http::cors::{Any, CorsLayer};
@@ -162,26 +160,6 @@ struct Args {
     /// Path to MCP config file (multi-server mode)
     #[arg(long)]
     mcp_config: Option<String>,
-
-    /// Comma-separated cloud backends in `id=https://host:port` or `https://host:port` form.
-    #[arg(long, value_delimiter = ',')]
-    cloud_backends: Option<Vec<String>>,
-
-    /// Relative weight for local backend score in hybrid mode.
-    #[arg(long, default_value_t = 1.0)]
-    hybrid_local_weight: f64,
-
-    /// Relative weight for cloud backend score in hybrid mode.
-    #[arg(long, default_value_t = 1.0)]
-    hybrid_cloud_weight: f64,
-
-    /// Refresh interval for cloud adapter status in hybrid/cloud routing.
-    #[arg(long, default_value_t = 5000)]
-    hybrid_status_ttl_ms: u64,
-
-    /// Automatically warm adapters on the non-selected cloud backends in hybrid mode.
-    #[arg(long, default_value_t = false)]
-    hybrid_adapter_autosync: bool,
 
     /// Enforce runtime-node boundary: public API accepts only local execution mode/scope.
     #[arg(long, default_value_t = true)]
@@ -649,36 +627,6 @@ async fn main() -> Result<()> {
         &pipeline_model_name,
     );
 
-    let cloud_specs = args.cloud_backends.clone().unwrap_or_default();
-    let mut cloud_backends =
-        CloudBackendConfig::parse_specs(&cloud_specs).map_err(candle_core::Error::msg)?;
-    if args.runtime_local_only_strict && !cloud_backends.is_empty() {
-        warn!(
-            "runtime_local_only_strict=true; ignoring configured cloud backends for external routing."
-        );
-        cloud_backends.clear();
-    }
-    if !cloud_backends.is_empty() {
-        let rendered = cloud_backends
-            .iter()
-            .map(|b| format!("{}={}", b.id, b.base_url))
-            .collect::<Vec<_>>()
-            .join(", ");
-        info!("Configured cloud backends: {}", rendered);
-    }
-
-    let backend_router = Arc::new(
-        BackendRouter::new(
-            cloud_backends,
-            args.hybrid_local_weight,
-            args.hybrid_cloud_weight,
-            Duration::from_millis(args.hybrid_status_ttl_ms),
-            args.hybrid_adapter_autosync,
-            Some(runtime_model_name.clone()),
-        )
-        .map_err(|err| candle_core::Error::msg(err.to_string()))?,
-    );
-
     let lora_manager = Arc::new(candle_vllm::openai::lora::LoRAManager::new(
         Some(runtime_model_name.clone()),
         8,
@@ -719,8 +667,7 @@ async fn main() -> Result<()> {
         runtime_local_only_strict: args.runtime_local_only_strict,
         mcp_manager: mcp_manager.clone(),
         lora_manager,
-        backend_router,
-        sticky_adapters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        session_adapters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
     };
 
     if let Some(manager) = &mcp_manager {
@@ -806,12 +753,6 @@ async fn main() -> Result<()> {
                     let (pipeline, _) = engine.get_pipeline(0).unwrap();
                     (pipeline.name().to_string(), data.lora_manager.status())
                 };
-                let cloud_backends = data.backend_router.cloud_backend_ids();
-                let mut execution_modes = vec!["local"];
-                if !data.runtime_local_only_strict && !cloud_backends.is_empty() {
-                    execution_modes.push("cloud");
-                    execution_modes.push("hybrid");
-                }
                 Json(json!({
                     "object": "list",
                     "data": [
@@ -826,9 +767,7 @@ async fn main() -> Result<()> {
                             "permission": [],
                             "max_active_loras": lora_status.max_active_loras,
                             "loaded_loras": lora_status.loaded_loras,
-                            "lora_mode": lora_status.lora_mode,
-                            "execution_modes": execution_modes,
-                            "cloud_backends": cloud_backends
+                            "lora_mode": lora_status.lora_mode
                         }
                     ]
                 }))

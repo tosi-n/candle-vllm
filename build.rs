@@ -5,6 +5,6 @@ fn main() {
     tonic_build::configure()
         .build_server(true)
         .build_client(false)
-        .compile_protos(&["proto/hybrie_runtime.proto"], &["proto"])
+        .compile_protos(&["proto/runtime_internal.proto"], &["proto"])
         .expect("failed to compile runtime internal protos");
 }

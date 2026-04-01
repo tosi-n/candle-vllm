@@ -301,7 +301,7 @@ impl LLMEngine {
                             task.encoding_format,
                             task.embedding_type,
                             task.adapter_id.clone(),
-                            task.adapter_timeline.clone(),
+                            task.adapter_schedule.clone(),
                             None,
                             None,
                         );
@@ -347,7 +347,7 @@ impl LLMEngine {
                     task.encoding_format.clone(),
                     task.embedding_type.clone(),
                     task.adapter_id.clone(),
-                    task.adapter_timeline.clone(),
+                    task.adapter_schedule.clone(),
                     None,
                     sender,
                 );
@@ -1690,7 +1690,7 @@ impl LLMEngine {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
-        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
         interactive_control: Option<Arc<InteractiveSessionControl>>,
         sender: Option<Sender<ChatResponse>>,
     ) -> SequenceGroup {
@@ -1711,7 +1711,7 @@ impl LLMEngine {
             encoding_format,
             embedding_type,
             adapter_id,
-            adapter_timeline,
+            adapter_schedule,
             interactive_control,
             sender,
         )
@@ -1729,7 +1729,7 @@ impl LLMEngine {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
-        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
         interactive_control: Arc<InteractiveSessionControl>,
     ) {
         let seq_group = self.create_sequence_group(
@@ -1744,7 +1744,7 @@ impl LLMEngine {
             encoding_format,
             embedding_type,
             adapter_id,
-            adapter_timeline,
+            adapter_schedule,
             Some(interactive_control.clone()),
             None,
         );
@@ -1778,7 +1778,7 @@ impl LLMEngine {
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
         adapter_id: Option<String>,
-        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
         sender: Option<Arc<Sender<ChatResponse>>>,
         sync_notify: Option<Arc<Notify>>,
     ) {
@@ -1817,7 +1817,7 @@ impl LLMEngine {
             encoding_format,
             embedding_type,
             adapter_id,
-            adapter_timeline,
+            adapter_schedule,
         };
         let mut waiting_tasks = self.waiting_tasks.write();
         waiting_tasks.push(task);

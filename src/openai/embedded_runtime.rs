@@ -9,7 +9,6 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::openai::backend_router::BackendRouter;
 use crate::openai::lora::{
     set_global_lora_manager, AdapterRecord, AdapterStatusResponse, LoRAManager,
     RegisterAdapterRequest,
@@ -157,7 +156,10 @@ fn derive_runtime_model_id(
     pipeline_name.trim().to_string()
 }
 
-fn parse_adapter_id(request: &ChatCompletionRequest, adapter_override: Option<String>) -> Option<String> {
+fn parse_adapter_id(
+    request: &ChatCompletionRequest,
+    adapter_override: Option<String>,
+) -> Option<String> {
     adapter_override
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
@@ -165,21 +167,21 @@ fn parse_adapter_id(request: &ChatCompletionRequest, adapter_override: Option<St
             request
                 .metadata
                 .as_ref()
-                .and_then(|metadata| metadata.hybrie.as_ref())
-                .and_then(|hybrie| hybrie.adapter_id.clone())
+                .and_then(|metadata| metadata.runtime.as_ref())
+                .and_then(|runtime| runtime.adapter_id.clone())
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty())
         })
 }
 
-fn parse_adapter_timeline(
+fn parse_adapter_schedule(
     request: &ChatCompletionRequest,
-) -> Option<Vec<crate::openai::requests::HybrieAdapterStep>> {
+) -> Option<Vec<crate::openai::requests::AdapterScheduleStep>> {
     let mut timeline = request
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.hybrie.as_ref())
-        .and_then(|hybrie| hybrie.adapter_timeline.clone())?;
+        .and_then(|metadata| metadata.runtime.as_ref())
+        .and_then(|runtime| runtime.adapter_schedule.clone())?;
 
     timeline.retain(|step| !step.adapter_id.trim().is_empty());
     if timeline.is_empty() {
@@ -190,17 +192,6 @@ fn parse_adapter_timeline(
         step.adapter_id = step.adapter_id.trim().to_string();
     }
     Some(timeline)
-}
-
-fn strip_mode_prefix(model: Option<String>) -> Option<String> {
-    model.map(|model_id| {
-        for prefix in ["local/", "cloud/", "hybrid/"] {
-            if let Some(stripped) = model_id.strip_prefix(prefix) {
-                return stripped.to_string();
-            }
-        }
-        model_id
-    })
 }
 
 async fn build_prompt(
@@ -278,10 +269,7 @@ async fn build_prompt(
         conversation.set_system_message(Some(new_system));
     }
 
-    Ok(conversation.get_prompt(
-        request.thinking.unwrap_or(false),
-        &tool_config.tools,
-    ))
+    Ok(conversation.get_prompt(request.thinking.unwrap_or(false), &tool_config.tools))
 }
 
 async fn check_length(
@@ -332,7 +320,10 @@ async fn check_length(
 
 impl EmbeddedCandleVllmHost {
     pub async fn new(config: EmbeddedRuntimeConfig) -> CandleResult<Self> {
-        if config.prefill_chunk_size.is_some_and(|size| size % 1024 != 0) {
+        if config
+            .prefill_chunk_size
+            .is_some_and(|size| size % 1024 != 0)
+        {
             candle_core::bail!("prefill_chunk_size must be divisible by 1024");
         }
 
@@ -488,15 +479,6 @@ impl EmbeddedCandleVllmHost {
             &pipeline_model_name,
         );
 
-        let backend_router = Arc::new(BackendRouter::new(
-            Vec::new(),
-            1.0,
-            1.0,
-            std::time::Duration::from_secs(5),
-            false,
-            Some(runtime_model_name.clone()),
-        )
-        .map_err(|err| candle_core::Error::msg(err.to_string()))?);
         let lora_manager = Arc::new(LoRAManager::new(
             Some(runtime_model_name.clone()),
             config.max_active_loras,
@@ -541,8 +523,7 @@ impl EmbeddedCandleVllmHost {
             runtime_local_only_strict: config.runtime_local_only_strict,
             mcp_manager: None,
             lora_manager: Arc::clone(&lora_manager),
-            backend_router,
-            sticky_adapters: Arc::new(RwLock::new(HashMap::new())),
+            session_adapters: Arc::new(RwLock::new(HashMap::new())),
         });
         let runtime_internal = RuntimeInternalService::new(
             Arc::clone(&data.model),
@@ -584,12 +565,11 @@ impl EmbeddedCandleVllmHost {
         self.data.lora_manager.register(request)
     }
 
-    pub async fn load_adapter(
-        &self,
-        adapter_id: &str,
-        pin: bool,
-    ) -> CandleResult<AdapterRecord> {
-        self.data.lora_manager.load_async(adapter_id, Some(pin)).await
+    pub async fn load_adapter(&self, adapter_id: &str, pin: bool) -> CandleResult<AdapterRecord> {
+        self.data
+            .lora_manager
+            .load_async(adapter_id, Some(pin))
+            .await
     }
 
     pub fn unload_adapter(&self, adapter_id: &str) -> CandleResult<AdapterRecord> {
@@ -642,7 +622,7 @@ impl EmbeddedCandleVllmHost {
         prompt_ids: Vec<u32>,
         sampling_params: Option<SamplingParams>,
         adapter_id: Option<String>,
-        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
         session_id: Option<String>,
         import_only: bool,
     ) -> CandleResult<EmbeddedSessionInfo> {
@@ -676,7 +656,7 @@ impl EmbeddedCandleVllmHost {
                 EncodingFormat::default(),
                 EmbeddingType::default(),
                 adapter_id,
-                adapter_timeline,
+                adapter_schedule,
                 control.clone(),
             );
             model.notify.notify_one();
@@ -701,13 +681,13 @@ impl EmbeddedCandleVllmHost {
         prompt_ids: Vec<u32>,
         sampling_params: Option<SamplingParams>,
         adapter_id: Option<String>,
-        adapter_timeline: Option<Vec<crate::openai::requests::HybrieAdapterStep>>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
     ) -> CandleResult<EmbeddedSessionInfo> {
         self.prefill_session_inner(
             prompt_ids,
             sampling_params,
             adapter_id,
-            adapter_timeline,
+            adapter_schedule,
             None,
             false,
         )
@@ -734,13 +714,15 @@ impl EmbeddedCandleVllmHost {
 
     pub fn session_info(&self, session_id: &str) -> CandleResult<Option<EmbeddedSessionInfo>> {
         let model = self.data.model.read();
-        Ok(model.get_session_lookup(session_id).map(|lookup| EmbeddedSessionInfo {
-            session_id: lookup.request_id,
-            prompt_len: lookup.prompt_len,
-            cached_len: lookup.total_len,
-            generated_tokens: lookup.total_len.saturating_sub(lookup.prompt_len),
-            adapter_id: lookup.adapter_id,
-        }))
+        Ok(model
+            .get_session_lookup(session_id)
+            .map(|lookup| EmbeddedSessionInfo {
+                session_id: lookup.request_id,
+                prompt_len: lookup.prompt_len,
+                cached_len: lookup.total_len,
+                generated_tokens: lookup.total_len.saturating_sub(lookup.prompt_len),
+                adapter_id: lookup.adapter_id,
+            }))
     }
 
     pub async fn decode_next(
@@ -810,19 +792,21 @@ impl EmbeddedCandleVllmHost {
         session_id: Option<String>,
     ) -> std::result::Result<EmbeddedChatOutput, APIError> {
         if request.logit_bias.as_ref().is_some_and(|x| !x.is_empty()) {
-            return Err(APIError::new_str("`logit_bias` is not currently supported."));
+            return Err(APIError::new_str(
+                "`logit_bias` is not currently supported.",
+            ));
         }
 
         let mut adapter_id = parse_adapter_id(&request, adapter_override);
-        let adapter_timeline = parse_adapter_timeline(&request);
+        let adapter_schedule = parse_adapter_schedule(&request);
         if adapter_id.is_none() {
             if let Some(session_id) = session_id.as_ref() {
-                adapter_id = self.data.sticky_adapters.read().get(session_id).cloned();
+                adapter_id = self.data.session_adapters.read().get(session_id).cloned();
             }
         }
         if let (Some(session_id), Some(adapter_id)) = (session_id.as_ref(), adapter_id.as_ref()) {
             self.data
-                .sticky_adapters
+                .session_adapters
                 .write()
                 .insert(session_id.clone(), adapter_id.clone());
         }
@@ -895,7 +879,10 @@ impl EmbeddedCandleVllmHost {
         let request_id = format!("cmpl-{}", Uuid::new_v4());
         let stream_request = request.stream.unwrap_or(false);
         let request_logprobs = request.logprobs.unwrap_or(false);
-        let model_name = strip_mode_prefix(request.model.clone()).unwrap_or_else(|| self.model_id.clone());
+        let model_name = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model_id.clone());
         let (response_tx, rx) = flume::unbounded();
         let sync_notify = Arc::new(Notify::new());
         let sync_completion_notify = if stream_request {
@@ -905,7 +892,7 @@ impl EmbeddedCandleVllmHost {
         };
         let data_for_engine = Arc::clone(&self.data);
         let adapter_for_engine = adapter_id.clone();
-        let timeline_for_engine = adapter_timeline.clone();
+        let timeline_for_engine = adapter_schedule.clone();
         let request_id_for_read = request_id.clone();
 
         let _ = tokio::task::spawn_blocking(move || {

@@ -152,19 +152,19 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionMetadata {
     #[serde(default)]
-    pub hybrie: Option<HybrieMetadata>,
+    pub runtime: Option<RuntimeRequestMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HybrieMetadata {
+pub struct RuntimeRequestMetadata {
     #[serde(default)]
     pub adapter_id: Option<String>,
     #[serde(default)]
-    pub adapter_timeline: Option<Vec<HybrieAdapterStep>>,
+    pub adapter_schedule: Option<Vec<AdapterScheduleStep>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HybrieAdapterStep {
+pub struct AdapterScheduleStep {
     pub start_step: usize,
     pub adapter_id: String,
 }

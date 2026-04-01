@@ -1090,20 +1090,20 @@ fn sanitize_path_component(value: &str) -> String {
 }
 
 fn registry_path_from_env() -> PathBuf {
-    if let Ok(path) = std::env::var("HYBRIE_ADAPTER_REGISTRY_PATH") {
+    if let Ok(path) = std::env::var("CANDLE_VLLM_ADAPTER_REGISTRY_PATH") {
         return PathBuf::from(path);
     }
-    PathBuf::from(".hybrie/adapter-registry.json")
+    PathBuf::from(".candle-vllm/adapter-registry.json")
 }
 
 fn artifact_root_from_env() -> Option<PathBuf> {
-    std::env::var("HYBRIE_ADAPTER_ARTIFACT_DIR")
+    std::env::var("CANDLE_VLLM_ADAPTER_ARTIFACT_DIR")
         .ok()
         .map(PathBuf::from)
 }
 
 fn default_artifact_root_for_registry(registry_path: &Path) -> PathBuf {
-    let parent = registry_path.parent().unwrap_or(Path::new(".hybrie"));
+    let parent = registry_path.parent().unwrap_or(Path::new(".candle-vllm"));
     parent.join("artifacts")
 }
 
@@ -1313,7 +1313,10 @@ thread_local! {
 pub fn set_global_lora_manager(manager: Arc<LoRAManager>) {
     let registry = GLOBAL_LORA_MANAGERS.get_or_init(|| RwLock::new(Vec::new()));
     let mut managers = registry.write();
-    if managers.iter().any(|existing| Arc::ptr_eq(existing, &manager)) {
+    if managers
+        .iter()
+        .any(|existing| Arc::ptr_eq(existing, &manager))
+    {
         return;
     }
     managers.push(manager);
