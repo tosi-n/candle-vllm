@@ -210,6 +210,8 @@ pub struct BlockEngine {
     block_size: usize,
     kvcache_mem_gpu: usize,
     prefix_cache: Option<PrefixCache>,
+    require_mamba_prefix_snapshots: bool,
+    mamba_prefix_blocks: HashMap<u64, usize>,
 }
 
 impl BlockEngine {
@@ -220,6 +222,7 @@ impl BlockEngine {
         num_cpu_blocks: usize,
         kvcache_mem_gpu: usize,
         prefix_cache: PrefixCacheConfig,
+        require_mamba_prefix_snapshots: bool,
     ) -> Self {
         let prefix_cache = if prefix_cache.enabled && prefix_cache.max_cached_blocks > 0 {
             Some(PrefixCache::new(block_size, prefix_cache))
@@ -234,6 +237,8 @@ impl BlockEngine {
             block_size,
             kvcache_mem_gpu,
             prefix_cache,
+            require_mamba_prefix_snapshots,
+            mamba_prefix_blocks: HashMap::new(),
         }
     }
 
@@ -377,6 +382,59 @@ impl BlockEngine {
 
     pub fn prefix_cache_enabled(&self) -> bool {
         self.prefix_cache.is_some()
+    }
+
+    pub fn prefix_hash_for_sequence(&self, sequence: &Sequence, token_len: usize) -> Option<u64> {
+        let prefix_cache = self.prefix_cache.as_ref()?;
+        let full_blocks = token_len / self.block_size;
+        if full_blocks == 0 {
+            return None;
+        }
+        prefix_cache.hash_for_blocks(&sequence.deref().get_token_ids(), full_blocks)
+    }
+
+    pub fn prefix_block_id_for_sequence(
+        &self,
+        sequence: &Sequence,
+        full_blocks: usize,
+    ) -> Option<usize> {
+        if full_blocks == 0 {
+            return None;
+        }
+        let table = self.block_tables.get(&sequence.deref().get_id())?;
+        table
+            .get(full_blocks.saturating_sub(1))
+            .map(|block| block.deref_mut().block_id)
+    }
+
+    pub fn invalidate_mamba_prefix_hash(&mut self, hash: u64) {
+        self.mamba_prefix_blocks.remove(&hash);
+    }
+
+    pub fn record_mamba_prefix_capture(&mut self, hash: u64, block_id: usize) {
+        if self.require_mamba_prefix_snapshots {
+            self.mamba_prefix_blocks.insert(hash, block_id);
+        }
+    }
+
+    pub fn fallback_sequence_to_full_prefill(&mut self, sequence: &Sequence) -> bool {
+        let seq_id = sequence.deref().get_id();
+        let logical_blocks = sequence.deref().get_logical_token_blocks();
+        let Some(old_table) = self.block_tables.remove(&seq_id) else {
+            return false;
+        };
+
+        for block in old_table {
+            self.release_block(block);
+        }
+
+        let mut new_table = VecDeque::new();
+        for _ in 0..logical_blocks {
+            new_table.push_back(self.gpu_allocator.allocate());
+        }
+        self.block_tables.insert(seq_id, new_table);
+        sequence.deref_mut().set_num_cached_tokens(0);
+        true
     }
 
     pub fn can_swap_out_seq_group(&self, seq_group: &SequenceGroup) -> bool {
@@ -651,6 +709,7 @@ mod tests {
                 enabled: true,
                 max_cached_blocks: 4,
             },
+            false,
         );
 
         let (group1, seq1) = make_group(1, 1, block_size, vec![1, 2, 3, 4, 5, 6, 7, 8]);

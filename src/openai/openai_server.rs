@@ -1,5 +1,8 @@
 use super::requests::Messages;
-use super::requests::{ChatCompletionRequest, EmbeddingRequest, EmbeddingType, EncodingFormat};
+use super::requests::{
+    extract_text_from_content, extract_text_from_required_content, ChatCompletionRequest,
+    EmbeddingRequest, EmbeddingType, EncodingFormat,
+};
 use super::responses::{APIError, ChatCompletionResponse, ChatResponder};
 use super::sampling_params::{EarlyStoppingCondition, SamplingParams};
 use super::streaming::{ChatResponse, Streamer, StreamingStatus};
@@ -45,14 +48,17 @@ async fn get_gen_prompt(
                 let role = message.role.as_str();
                 if role == "system" {
                     if let Some(content) = &message.content {
-                        conversation.set_system_message(Some(content.clone()));
+                        let text = extract_text_from_required_content(content);
+                        if !text.is_empty() {
+                            conversation.set_system_message(Some(text));
+                        }
                     }
                     continue;
                 }
 
                 if role == "tool" {
                     let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
-                    let content = message.content.clone().unwrap_or_default();
+                    let content = extract_text_from_content(message.content.as_ref());
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
                         let prompt = format!("[Tool Result for {}]: {}", tool_call_id, trimmed);
@@ -62,7 +68,10 @@ async fn get_gen_prompt(
                 }
 
                 if let Some(content) = &message.content {
-                    conversation.append_message(role.to_string(), content.clone());
+                    let text = extract_text_from_required_content(content);
+                    if !text.is_empty() {
+                        conversation.append_message(role.to_string(), text);
+                    }
                 }
             }
         }
@@ -163,7 +172,6 @@ async fn check_length(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 fn parse_adapter_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {
     if let Some(adapter_id) = headers
         .get("x-runtime-adapter-id")

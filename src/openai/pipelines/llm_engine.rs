@@ -149,9 +149,21 @@ impl LLMEngine {
         prefill_chunk_size: Option<usize>,
     ) -> Result<Arc<RwLock<Self>>> {
         let num_threads: usize = pipelines.len();
+        let require_mamba_prefix_snapshots = pipelines.values().any(|(pipeline, _)| {
+            matches!(
+                pipeline.model,
+                crate::openai::pipelines::pipeline::LLMModel::Qwen3_5(_)
+                    | crate::openai::pipelines::pipeline::LLMModel::Qwen3_5MoE(_)
+                    | crate::openai::pipelines::pipeline::LLMModel::Qwen3VL(_)
+            )
+        });
         let engine = Arc::new(RwLock::new(Self {
             pipelines,
-            scheduler: Scheduler::new(scheduler_config, cache_config),
+            scheduler: Scheduler::new(
+                scheduler_config,
+                cache_config,
+                require_mamba_prefix_snapshots,
+            ),
             seq_id: 0,
             cache_config: cache_config.clone(),
             config: config.clone(),
@@ -426,6 +438,7 @@ impl LLMEngine {
             model: pipeline.name().to_string(),
             object: "chat.completion.chunk",
             system_fingerprint: None,
+            usage: None,
         }
     }
 
@@ -671,6 +684,7 @@ impl LLMEngine {
                             &positions,
                             Some(&cache_engine.get_kv_cache()),
                             &metadata,
+                            None,
                         )?
                     };
                     Ok((x, metadata.is_prefill, model_name))
@@ -938,7 +952,10 @@ impl LLMEngine {
                                         data.stream_tool_parser =
                                             Some(StreamToolParser::new_with_config(
                                                 &pipeline.tool_model_type,
+                                                pipeline.tool_parser_model_id.clone(),
                                                 pipeline.tool_config.clone(),
+                                                Vec::new(),
+                                                pipeline.enforce_parser.clone(),
                                             ));
                                     }
                                     if let Some(parser) = data.stream_tool_parser.as_mut() {
@@ -1015,12 +1032,6 @@ impl LLMEngine {
                                                 }
                                             }
                                         }
-                                        ParserState::MaybeStart => {
-                                            let buffer = parser.take_buffer();
-                                            if !buffer.is_empty() {
-                                                final_content = Some(buffer);
-                                            }
-                                        }
                                         ParserState::Normal => {}
                                     }
                                 }
@@ -1062,6 +1073,7 @@ impl LLMEngine {
                                     model: pipeline.name().to_string(),
                                     object: "chat.completion.chunk",
                                     system_fingerprint: None,
+                                    usage: None,
                                 };
 
                                 tracing::info!("Sending final tool call chunk: {:?}", chunk);
@@ -1169,7 +1181,10 @@ impl LLMEngine {
                             let (content, tool_calls) = if should_parse_tools {
                                 let mut parser = StreamToolParser::new_with_config(
                                     &pipeline.tool_model_type,
+                                    pipeline.tool_parser_model_id.clone(),
                                     pipeline.tool_config.clone(),
+                                    Vec::new(),
+                                    pipeline.enforce_parser.clone(),
                                 );
                                 let mut pending_tool_calls = Vec::new();
                                 let mut accumulated = String::new();
@@ -1198,12 +1213,6 @@ impl LLMEngine {
                                             if !buffer.is_empty() {
                                                 accumulated.push_str(&buffer);
                                             }
-                                        }
-                                    }
-                                    ParserState::MaybeStart => {
-                                        let buffer = parser.take_buffer();
-                                        if !buffer.is_empty() {
-                                            accumulated.push_str(&buffer);
                                         }
                                     }
                                     ParserState::Normal => {}
@@ -1558,6 +1567,8 @@ impl LLMEngine {
 
         let input_metadata = InputMetadata {
             is_prefill: true,
+            sequence_ids: None,
+            mamba_slot_mapping: None,
             slot_mapping,
             block_tables,
             context_lens,
@@ -1568,6 +1579,7 @@ impl LLMEngine {
             max_context_len,
             disable_flash_attn: None,
             seqlens: None,
+            flashinfer_metadata: None,
         };
 
         Ok(PreparedInputs {
@@ -1658,6 +1670,8 @@ impl LLMEngine {
         let block_tables = block_tables.reshape(((), max_block_table_len))?;
         let input_metadata = InputMetadata {
             is_prefill: false,
+            sequence_ids: None,
+            mamba_slot_mapping: None,
             slot_mapping,
             block_tables: Some(block_tables),
             context_lens: Some(context_lens),
@@ -1668,6 +1682,7 @@ impl LLMEngine {
             max_context_len: max_context_len as usize,
             disable_flash_attn: None,
             seqlens: None,
+            flashinfer_metadata: None,
         };
 
         Ok(PreparedInputs {
@@ -1816,6 +1831,9 @@ impl LLMEngine {
             is_embedding,
             encoding_format,
             embedding_type,
+            tools: Vec::new(),
+            images: None,
+            include_usage: false,
             adapter_id,
             adapter_schedule,
         };

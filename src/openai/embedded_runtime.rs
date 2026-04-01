@@ -15,7 +15,10 @@ use crate::openai::lora::{
 };
 use crate::openai::pipelines::llm_engine::{InteractiveSessionSnapshot, LLMEngine};
 use crate::openai::pipelines::pipeline::DefaultLoader;
-use crate::openai::requests::{ChatCompletionRequest, EmbeddingType, EncodingFormat, Messages};
+use crate::openai::requests::{
+    extract_text_from_content, extract_text_from_required_content, ChatCompletionRequest,
+    EmbeddingType, EncodingFormat, Messages,
+};
 use crate::openai::responses::{APIError, ChatCompletionResponse};
 use crate::openai::runtime_internal::{RuntimeInternalService, RuntimeKvProfile};
 use crate::openai::sampling_params::{EarlyStoppingCondition, GenerationConfig, SamplingParams};
@@ -212,14 +215,17 @@ async fn build_prompt(
                 let role = message.role.as_str();
                 if role == "system" {
                     if let Some(content) = &message.content {
-                        conversation.set_system_message(Some(content.clone()));
+                        let text = extract_text_from_required_content(content);
+                        if !text.is_empty() {
+                            conversation.set_system_message(Some(text));
+                        }
                     }
                     continue;
                 }
 
                 if role == "tool" {
                     let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
-                    let content = message.content.clone().unwrap_or_default();
+                    let content = extract_text_from_content(message.content.as_ref());
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
                         let prompt = format!("[Tool Result for {}]: {}", tool_call_id, trimmed);
@@ -229,7 +235,10 @@ async fn build_prompt(
                 }
 
                 if let Some(content) = &message.content {
-                    conversation.append_message(role.to_string(), content.clone());
+                    let text = extract_text_from_required_content(content);
+                    if !text.is_empty() {
+                        conversation.append_message(role.to_string(), text);
+                    }
                 }
             }
         }
@@ -331,6 +340,8 @@ impl EmbeddedCandleVllmHost {
             config.model_id.clone(),
             config.weight_path.clone(),
             config.weight_file.clone(),
+            None,
+            None,
         ));
         let (paths, gguf) =
             loader.prepare_model_weights(config.hf_token.clone(), config.hf_token_path.clone())?;

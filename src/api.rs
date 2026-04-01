@@ -1,7 +1,9 @@
 use crate::openai::models::Config;
 use crate::openai::pipelines::llm_engine::LLMEngine;
 use crate::openai::pipelines::pipeline::DefaultLoader;
-use crate::openai::requests::Messages;
+use crate::openai::requests::{
+    extract_text_from_content, extract_text_from_required_content, Messages,
+};
 use crate::openai::resolve_tools_for_request;
 use crate::openai::sampling_params::{GenerationConfig, SamplingParams};
 use crate::scheduler::cache_engine::{CacheConfig, CacheEngine};
@@ -165,6 +167,8 @@ impl EngineBuilder {
             model_id.clone(),
             weight_path.clone(),
             weight_file.clone(),
+            None,
+            None,
         ));
 
         // Use cached token if available, or try to load safely without prompt (api mode should not block on stdin)
@@ -407,14 +411,17 @@ impl Engine {
                         let role = message.role.as_str();
                         if role == "system" {
                             if let Some(content) = &message.content {
-                                conversation.set_system_message(Some(content.clone()));
+                                let text = extract_text_from_required_content(content);
+                                if !text.is_empty() {
+                                    conversation.set_system_message(Some(text));
+                                }
                             }
                             continue;
                         }
 
                         if role == "tool" {
                             let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
-                            let content = message.content.clone().unwrap_or_default();
+                            let content = extract_text_from_content(message.content.as_ref());
                             let trimmed = content.trim();
                             if !trimmed.is_empty() {
                                 let prompt =
@@ -425,7 +432,10 @@ impl Engine {
                         }
 
                         if let Some(content) = &message.content {
-                            conversation.append_message(role.to_string(), content.clone());
+                            let text = extract_text_from_required_content(content);
+                            if !text.is_empty() {
+                                conversation.append_message(role.to_string(), text);
+                            }
                         }
                     }
                 }
