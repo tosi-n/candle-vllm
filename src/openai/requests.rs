@@ -145,6 +145,28 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<crate::tools::Tool>>,
     #[serde(default)]
     pub tool_choice: Option<crate::tools::ToolChoice>,
+    #[serde(default)]
+    pub metadata: Option<ChatCompletionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatCompletionMetadata {
+    #[serde(default)]
+    pub runtime: Option<RuntimeRequestMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeRequestMetadata {
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub adapter_schedule: Option<Vec<AdapterScheduleStep>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterScheduleStep {
+    pub start_step: usize,
+    pub adapter_id: String,
 }
 
 impl Default for ChatCompletionRequest {
@@ -175,6 +197,7 @@ impl Default for ChatCompletionRequest {
             thinking: None,
             tools: None,
             tool_choice: None,
+            metadata: None,
         }
     }
 }

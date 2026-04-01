@@ -5,14 +5,18 @@ use crate::{
 };
 use candle_core::Device;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokenizers::{EncodeInput, Encoding, Tokenizer};
 #[cfg(feature = "nccl")]
 pub mod communicator;
 pub mod distributed;
+pub mod embedded_runtime;
+pub mod lora;
 pub mod requests;
 pub mod responses;
+pub mod runtime_internal;
 pub mod sampling_params;
 pub mod streaming;
 use either::Either;
@@ -112,7 +116,10 @@ pub struct OpenAIServerData {
     pub pipeline_config: PipelineConfig,
     pub record_conversation: bool,
     pub device: Device,
+    pub runtime_local_only_strict: bool,
     pub mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    pub lora_manager: Arc<lora::LoRAManager>,
+    pub session_adapters: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -130,6 +137,8 @@ pub struct TaskData {
     pub tools: Vec<Tool>,
     pub images: Option<multimodal::ImageData>,
     pub include_usage: bool,
+    pub adapter_id: Option<String>,
+    pub adapter_schedule: Option<Vec<requests::AdapterScheduleStep>>,
 }
 
 pub mod conversation;
@@ -159,10 +168,10 @@ fn normalize_tool_choice(choice: &Option<ToolChoice>) -> ToolChoiceKind {
         Some(ToolChoice::Function { function, .. }) => {
             ToolChoiceKind::Function(function.name.clone())
         }
-        Some(ToolChoice::Mode(mode)) => match mode {
-            crate::tools::ToolChoiceMode::Auto => ToolChoiceKind::Auto,
-            crate::tools::ToolChoiceMode::None => ToolChoiceKind::None,
-            crate::tools::ToolChoiceMode::Required => ToolChoiceKind::Auto,
+        Some(ToolChoice::Auto(value)) | Some(ToolChoice::None(value)) => match value.as_str() {
+            "none" => ToolChoiceKind::None,
+            "auto" => ToolChoiceKind::Auto,
+            _ => ToolChoiceKind::Auto,
         },
     }
 }

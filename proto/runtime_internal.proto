@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package candle.vllm.runtime.v1;
+
+message SessionCompatibilityMetadata {
+  string model_id = 1;
+  string model_hash = 2;
+  string adapter_id = 3;
+  string adapter_version = 4;
+  string dtype = 5;
+  uint64 block_size = 6;
+  uint64 num_layers = 7;
+  uint64 kv_heads = 8;
+  uint64 head_dim = 9;
+  uint64 prompt_len = 10;
+  string session_id = 11;
+  string checksum = 12;
+}
+
+message ExportSessionKvRequest {
+  string session_id = 1;
+}
+
+message KvTransferChunk {
+  string session_id = 1;
+  uint64 sequence_no = 2;
+  bytes payload = 3;
+  bool is_last = 4;
+  string checksum = 5;
+  SessionCompatibilityMetadata metadata = 6;
+}
+
+message ImportSessionKvResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 chunks_received = 3;
+  uint64 bytes_received = 4;
+}
+
+message GetSessionInfoRequest {
+  string session_id = 1;
+}
+
+message GetSessionInfoResponse {
+  bool found = 1;
+  string message = 2;
+  string session_id = 3;
+  uint64 prompt_len = 4;
+  uint64 total_len = 5;
+  uint64 block_count = 6;
+  repeated uint64 block_ids = 7;
+  string adapter_id = 8;
+  SessionCompatibilityMetadata metadata = 9;
+}
+
+message AdapterLoadRequest {
+  string adapter_id = 1;
+  bool pinned = 2;
+  bool wait = 3;
+}
+
+message AdapterLoadResponse {
+  bool accepted = 1;
+  string message = 2;
+  string state = 3;
+}
+
+message AdapterUnloadRequest {
+  string adapter_id = 1;
+}
+
+message AdapterUnloadResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AdapterStatusRequest {}
+
+message AdapterState {
+  string adapter_id = 1;
+  string state = 2;
+  bool pinned = 3;
+  uint64 rank = 4;
+  string last_error = 5;
+}
+
+message AdapterStatusResponse {
+  uint64 max_active_loras = 1;
+  uint64 loaded_loras = 2;
+  string lora_mode = 3;
+  repeated AdapterState adapters = 4;
+  uint64 slots_free = 5;
+}
+
+service RuntimeInternal {
+  rpc ExportSessionKv(ExportSessionKvRequest) returns (stream KvTransferChunk);
+  rpc ImportSessionKv(stream KvTransferChunk) returns (ImportSessionKvResponse);
+  rpc GetSessionInfo(GetSessionInfoRequest) returns (GetSessionInfoResponse);
+  rpc LoadAdapter(AdapterLoadRequest) returns (AdapterLoadResponse);
+  rpc UnloadAdapter(AdapterUnloadRequest) returns (AdapterUnloadResponse);
+  rpc GetAdapterStatus(AdapterStatusRequest) returns (AdapterStatusResponse);
+}

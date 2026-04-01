@@ -9,14 +9,52 @@ use candle::{DType, Device, Module, Result, Tensor};
 use candle_core as candle;
 use candle_nn::RmsNorm;
 use parking_lot::RwLock;
+use serde_json::Value;
 use std::iter::zip;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 impl Qwen {
+    fn load_raw_config(filename: &PathBuf) -> Result<Config> {
+        let bytes = std::fs::read(filename.clone()).map_err(candle_core::Error::wrap)?;
+        let root: Value = serde_json::from_slice(&bytes).map_err(candle_core::Error::wrap)?;
+        let mut effective = root
+            .get("text_config")
+            .cloned()
+            .unwrap_or_else(|| root.clone());
+
+        if let Some(obj) = effective.as_object_mut() {
+            if !obj.contains_key("architectures") {
+                if let Some(architectures) = root.get("architectures") {
+                    obj.insert("architectures".to_string(), architectures.clone());
+                }
+            }
+            if !obj.contains_key("bos_token_id") {
+                if let Some(bos_token_id) = root.get("bos_token_id") {
+                    obj.insert("bos_token_id".to_string(), bos_token_id.clone());
+                }
+            }
+            if !obj.contains_key("eos_token_id") {
+                if let Some(eos_token_id) = root.get("eos_token_id") {
+                    obj.insert("eos_token_id".to_string(), eos_token_id.clone());
+                }
+            }
+            if !obj.contains_key("quantization_config") {
+                if let Some(quantization_config) = root.get("quantization_config") {
+                    obj.insert(
+                        "quantization_config".to_string(),
+                        quantization_config.clone(),
+                    );
+                }
+            }
+        }
+
+        serde_json::from_value(effective).map_err(candle_core::Error::wrap)
+    }
+
     pub fn load_config(filename: &PathBuf, isq: Option<String>) -> Result<Config> {
-        let mut config = Config::load_config(filename.clone())?;
+        let mut config = Self::load_raw_config(filename)?;
         config.head_dim = Some(
             config
                 .head_dim
@@ -332,5 +370,77 @@ impl Qwen {
 
     pub fn get_config(&self) -> &Config {
         &self.cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Qwen;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_config_from_causal_schema() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 1024,
+                "intermediate_size": 4096,
+                "vocab_size": 151936,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "rms_norm_eps": 1e-6,
+                "eos_token_id": 151643,
+                "bos_token_id": 151643,
+                "max_position_embeddings": 32768
+            }"#,
+        )
+        .expect("write config");
+
+        let cfg = Qwen::load_config(&path, None).expect("load config");
+        assert_eq!(cfg.num_hidden_layers, 24);
+        assert_eq!(cfg.num_key_value_heads, Some(8));
+        assert_eq!(cfg.head_dim, Some(64));
+    }
+
+    #[test]
+    fn load_config_from_conditional_text_schema() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "bos_token_id": 151643,
+                "eos_token_id": 151645,
+                "text_config": {
+                    "hidden_size": 1280,
+                    "intermediate_size": 5120,
+                    "vocab_size": 151936,
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 20,
+                    "num_key_value_heads": 4,
+                    "rms_norm_eps": 1e-6,
+                    "eos_token_id": 151645,
+                    "max_position_embeddings": 32768
+                }
+            }"#,
+        )
+        .expect("write config");
+
+        let cfg = Qwen::load_config(&path, None).expect("load config");
+        assert_eq!(cfg.num_hidden_layers, 28);
+        assert_eq!(cfg.num_key_value_heads, Some(4));
+        assert_eq!(cfg.head_dim, Some(64));
+        assert_eq!(
+            cfg.architectures
+                .as_ref()
+                .expect("architectures should be preserved")[0],
+            "Qwen3_5ForConditionalGeneration"
+        );
     }
 }

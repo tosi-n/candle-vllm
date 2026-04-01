@@ -132,6 +132,7 @@ pub enum ChatResponder {
     Streamer(Sse<Streamer>),
     Completion(ChatCompletionResponse),
     Embedding(EmbeddingResponse),
+    Raw(axum::response::Response),
     ModelError(APIError),
     InternalError(APIError),
     ValidationError(APIError),
@@ -143,6 +144,7 @@ impl IntoResponse for ChatResponder {
             ChatResponder::Streamer(s) => s.into_response(),
             ChatResponder::Completion(s) => Json(s).into_response(),
             ChatResponder::Embedding(s) => Json(s).into_response(),
+            ChatResponder::Raw(r) => r,
             ChatResponder::InternalError(e) => {
                 JsonError::new(e.to_string()).to_response(http::StatusCode::INTERNAL_SERVER_ERROR)
             }

@@ -1,6 +1,6 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
-    hash::{Hash, Hasher},
+    collections::{hash_map::Entry, HashMap, VecDeque},
+    hash::Hash,
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, Mutex, MutexGuard},
@@ -8,7 +8,6 @@ use std::{
 
 use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixMatch};
 use super::sequence::{Sequence, SequenceGroup};
-use crate::openai::multimodal::ImageData;
 
 pub struct LogicalTokenBlock {
     tokens: Vec<u32>,
@@ -49,12 +48,23 @@ impl LogicalTokenBlock {
 #[derive(Hash, PartialEq, Eq)]
 pub struct _PhysicalTokenBlock {
     pub block_id: usize,
-    pub(crate) block_size: usize,
+    block_size: usize,
     pub refcount: usize,
-    pub(crate) is_gpu: bool,
+    is_gpu: bool,
 }
 
 pub struct PhysicalTokenBlock(pub Mutex<_PhysicalTokenBlock>);
+
+impl _PhysicalTokenBlock {
+    pub fn new(block_id: usize, block_size: usize, refcount: usize, is_gpu: bool) -> Self {
+        Self {
+            block_id,
+            block_size,
+            refcount,
+            is_gpu,
+        }
+    }
+}
 
 impl PhysicalTokenBlock {
     pub fn deref_mut(&self) -> MutexGuard<'_, _PhysicalTokenBlock> {
@@ -200,21 +210,9 @@ pub struct BlockEngine {
     block_size: usize,
     kvcache_mem_gpu: usize,
     prefix_cache: Option<PrefixCache>,
-    require_mamba_prefix_snapshots: bool,
-    valid_mamba_prefix_hashes: HashSet<u64>,
-    prefix_block_id_by_mamba_hash: HashMap<u64, usize>,
-    mamba_hashes_by_prefix_block_id: HashMap<usize, HashSet<u64>>,
 }
 
 impl BlockEngine {
-    fn image_prefix_seed(images: &ImageData) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        images.raw.hash(&mut hasher);
-        images.shape.hash(&mut hasher);
-        images.patches.hash(&mut hasher);
-        hasher.finish()
-    }
-
     #[must_use]
     pub fn new(
         block_size: usize,
@@ -222,7 +220,6 @@ impl BlockEngine {
         num_cpu_blocks: usize,
         kvcache_mem_gpu: usize,
         prefix_cache: PrefixCacheConfig,
-        require_mamba_prefix_snapshots: bool,
     ) -> Self {
         let prefix_cache = if prefix_cache.enabled && prefix_cache.max_cached_blocks > 0 {
             Some(PrefixCache::new(block_size, prefix_cache))
@@ -237,10 +234,6 @@ impl BlockEngine {
             block_size,
             kvcache_mem_gpu,
             prefix_cache,
-            require_mamba_prefix_snapshots,
-            valid_mamba_prefix_hashes: HashSet::new(),
-            prefix_block_id_by_mamba_hash: HashMap::new(),
-            mamba_hashes_by_prefix_block_id: HashMap::new(),
         }
     }
 
@@ -265,16 +258,7 @@ impl BlockEngine {
         let num_required_blocks = if let Some(prefix_cache) = self.prefix_cache.as_mut() {
             let seq = seq_group.get_seqs().values().nth(0).unwrap();
             let tokens = seq.deref().deref().get_token_ids();
-            let seed = seq
-                .deref()
-                .deref()
-                .get_images()
-                .as_ref()
-                .map(Self::image_prefix_seed);
-            let PrefixMatch {
-                matched_blocks,
-                last_hash,
-            } = prefix_cache.match_prefix_with_seed(&tokens, seed);
+            let PrefixMatch { matched_blocks, .. } = prefix_cache.match_prefix(&tokens);
             let full_blocks = tokens.len() / block_size;
             let matched_blocks = if matched_blocks == full_blocks
                 && tokens.len() % block_size == 0
@@ -284,27 +268,16 @@ impl BlockEngine {
             } else {
                 matched_blocks
             };
-            let matched_blocks = Self::resolve_valid_mamba_matched_blocks(
-                self.require_mamba_prefix_snapshots,
-                &self.valid_mamba_prefix_hashes,
-                prefix_cache,
-                matched_blocks,
-                last_hash,
-            );
             let logical_blocks = seq_group.get_total_logical_token_blocks();
             logical_blocks.saturating_sub(matched_blocks)
         } else {
             seq_group.get_total_logical_token_blocks()
         };
-        let mut num_free_gpu_blocks = *self.gpu_allocator.get_num_free_blocks();
-        if num_free_gpu_blocks < num_required_blocks {
-            self.evict_prefix_cache_until_free(num_required_blocks);
-            num_free_gpu_blocks = *self.gpu_allocator.get_num_free_blocks();
-        }
+        let num_free_gpu_blocks = *self.gpu_allocator.get_num_free_blocks();
 
         if self.num_gpu_blocks < num_required_blocks {
             AllocStatus::Impossible
-        } else if num_free_gpu_blocks >= num_required_blocks {
+        } else if num_free_gpu_blocks > num_required_blocks {
             AllocStatus::Ok
         } else {
             AllocStatus::Later
@@ -393,224 +366,17 @@ impl BlockEngine {
             tokens.len(),
             full_blocks
         );
-        let seed = sequence
-            .deref()
-            .get_images()
-            .as_ref()
-            .map(Self::image_prefix_seed);
-        let evicted = prefix_cache.insert_prefix_with_seed(&tokens, &blocks, seed);
+        let evicted = prefix_cache.insert_prefix(&tokens, &blocks);
         if !evicted.is_empty() {
             tracing::info!("Prefix cache evicted {} blocks after insert", evicted.len());
         }
-        let evicted_block_ids = evicted
-            .iter()
-            .map(|block| block.deref_mut().block_id)
-            .collect::<Vec<_>>();
-        self.handle_mamba_prefix_evicted_blocks(&evicted_block_ids);
         for block in evicted {
             self.release_block(block);
         }
     }
 
-    pub fn evict_prefix_cache_until_free(&mut self, min_free_blocks: usize) -> usize {
-        let mut total_evicted = 0;
-        loop {
-            if *self.gpu_allocator.get_num_free_blocks() >= min_free_blocks {
-                break;
-            }
-            let evicted = {
-                let Some(prefix_cache) = self.prefix_cache.as_mut() else {
-                    break;
-                };
-                prefix_cache.evict_blocks(1)
-            };
-            if evicted.is_empty() {
-                break;
-            }
-            let evicted_block_ids = evicted
-                .iter()
-                .map(|block| block.deref_mut().block_id)
-                .collect::<Vec<_>>();
-            self.handle_mamba_prefix_evicted_blocks(&evicted_block_ids);
-            total_evicted += evicted.len();
-            for block in evicted {
-                self.release_block(block);
-            }
-        }
-        total_evicted
-    }
-
     pub fn prefix_cache_enabled(&self) -> bool {
         self.prefix_cache.is_some()
-    }
-
-    pub fn prefix_hash_for_sequence(
-        &self,
-        sequence: &Sequence,
-        processed_tokens: usize,
-    ) -> Option<u64> {
-        let prefix_cache = self.prefix_cache.as_ref()?;
-        if !prefix_cache.enabled() {
-            return None;
-        }
-        let num_cached = sequence.deref().get_num_cached_tokens();
-        if let Some(hash) = sequence.deref().get_mamba_prefix_hash() {
-            if num_cached > 0 && processed_tokens <= num_cached {
-                return Some(hash);
-            }
-        }
-        let tokens = sequence.deref().get_token_ids();
-        let full_blocks = processed_tokens.min(tokens.len()) / self.block_size;
-        if full_blocks == 0 {
-            return None;
-        }
-        let seed = sequence
-            .deref()
-            .get_images()
-            .as_ref()
-            .map(Self::image_prefix_seed);
-        prefix_cache.hash_for_blocks_with_seed(&tokens, full_blocks, seed)
-    }
-
-    pub fn prefix_block_id_for_sequence(
-        &self,
-        sequence: &Sequence,
-        full_blocks: usize,
-    ) -> Option<usize> {
-        if full_blocks == 0 {
-            return None;
-        }
-        self.block_tables
-            .get(&sequence.deref().get_id())
-            .and_then(|table| table.get(full_blocks.saturating_sub(1)))
-            .map(|block| block.deref_mut().block_id)
-    }
-
-    pub fn record_mamba_prefix_capture(&mut self, hash: u64, block_id: usize) {
-        if let Some(old_block_id) = self.prefix_block_id_by_mamba_hash.insert(hash, block_id) {
-            if old_block_id != block_id {
-                if let Some(hashes) = self.mamba_hashes_by_prefix_block_id.get_mut(&old_block_id) {
-                    hashes.remove(&hash);
-                    if hashes.is_empty() {
-                        self.mamba_hashes_by_prefix_block_id.remove(&old_block_id);
-                    }
-                }
-            }
-        }
-        self.valid_mamba_prefix_hashes.insert(hash);
-        self.mamba_hashes_by_prefix_block_id
-            .entry(block_id)
-            .or_default()
-            .insert(hash);
-    }
-
-    pub fn invalidate_mamba_prefix_hash(&mut self, hash: u64) {
-        self.valid_mamba_prefix_hashes.remove(&hash);
-        if let Some(block_id) = self.prefix_block_id_by_mamba_hash.remove(&hash) {
-            if let Some(hashes) = self.mamba_hashes_by_prefix_block_id.get_mut(&block_id) {
-                hashes.remove(&hash);
-                if hashes.is_empty() {
-                    self.mamba_hashes_by_prefix_block_id.remove(&block_id);
-                }
-            }
-        }
-    }
-
-    fn handle_mamba_prefix_evicted_blocks(&mut self, evicted_block_ids: &[usize]) {
-        if evicted_block_ids.is_empty() {
-            return;
-        }
-
-        for &block_id in evicted_block_ids {
-            if let Some(hashes) = self.mamba_hashes_by_prefix_block_id.remove(&block_id) {
-                for hash in hashes {
-                    self.valid_mamba_prefix_hashes.remove(&hash);
-                    self.prefix_block_id_by_mamba_hash.remove(&hash);
-                }
-            }
-        }
-    }
-
-    fn resolve_valid_mamba_matched_blocks(
-        require_mamba_prefix_snapshots: bool,
-        valid_hashes: &HashSet<u64>,
-        prefix_cache: &PrefixCache,
-        matched_blocks: usize,
-        last_hash: Option<u64>,
-    ) -> usize {
-        if matched_blocks == 0 {
-            return 0;
-        }
-        if !require_mamba_prefix_snapshots {
-            return matched_blocks;
-        }
-        let Some(last_hash) = last_hash else {
-            return 0;
-        };
-        let hashes = prefix_cache.hashes_for_match(last_hash);
-        if hashes.len() < matched_blocks {
-            return 0;
-        }
-        let mut valid_blocks = matched_blocks;
-        while valid_blocks > 0 {
-            let candidate_hash = hashes[valid_blocks - 1];
-            if valid_hashes.contains(&candidate_hash) {
-                break;
-            }
-            valid_blocks -= 1;
-        }
-        valid_blocks
-    }
-
-    /// Rebuild a running sequence block table without shared prefix-cache blocks.
-    /// Returns false when insufficient free GPU blocks are available for full reallocation.
-    pub fn fallback_sequence_to_full_prefill(&mut self, sequence: &Sequence) -> bool {
-        let seq_id = sequence.deref().get_id();
-        let logical_blocks = sequence.deref().get_logical_token_blocks();
-
-        let Some(old_table) = self.block_tables.remove(&seq_id) else {
-            return false;
-        };
-
-        for block in &old_table {
-            self.release_block(block.clone());
-        }
-
-        if *self.gpu_allocator.get_num_free_blocks() < logical_blocks {
-            let _ = self.evict_prefix_cache_until_free(logical_blocks);
-        }
-
-        if *self.gpu_allocator.get_num_free_blocks() < logical_blocks {
-            for block in &old_table {
-                let (was_zero, is_gpu) = {
-                    let mut inner = block.deref_mut();
-                    let was_zero = inner.refcount == 0;
-                    inner.refcount += 1;
-                    (was_zero, inner.is_gpu)
-                };
-                if was_zero {
-                    if is_gpu {
-                        self.gpu_allocator
-                            .free_blocks
-                            .retain(|candidate| !Arc::ptr_eq(candidate, block));
-                    } else {
-                        self.cpu_allocator
-                            .free_blocks
-                            .retain(|candidate| !Arc::ptr_eq(candidate, block));
-                    }
-                }
-            }
-            self.block_tables.insert(seq_id, old_table);
-            return false;
-        }
-
-        let mut new_table = VecDeque::with_capacity(logical_blocks);
-        for _ in 0..logical_blocks {
-            new_table.push_back(self.gpu_allocator.allocate());
-        }
-        self.block_tables.insert(seq_id, new_table);
-        sequence.deref_mut().set_num_cached_tokens(0);
-        true
     }
 
     pub fn can_swap_out_seq_group(&self, seq_group: &SequenceGroup) -> bool {
@@ -749,20 +515,13 @@ impl BlockEngine {
 
         if let Some(seq) = seqs.first() {
             let tokens = seq.deref().deref().get_token_ids();
-            let valid_hashes = self.valid_mamba_prefix_hashes.clone();
             if let Some(prefix_cache) = self.prefix_cache.as_mut() {
-                let seed = seq
-                    .deref()
-                    .deref()
-                    .get_images()
-                    .as_ref()
-                    .map(Self::image_prefix_seed);
                 let PrefixMatch {
                     matched_blocks,
                     last_hash,
-                } = prefix_cache.match_prefix_with_seed(&tokens, seed);
+                } = prefix_cache.match_prefix(&tokens);
                 let full_blocks = tokens.len() / block_size;
-                let raw_matched_blocks = if matched_blocks == full_blocks
+                let matched_blocks = if matched_blocks == full_blocks
                     && tokens.len() % block_size == 0
                     && matched_blocks > 0
                 {
@@ -770,37 +529,6 @@ impl BlockEngine {
                 } else {
                     matched_blocks
                 };
-                let mut matched_blocks = Self::resolve_valid_mamba_matched_blocks(
-                    self.require_mamba_prefix_snapshots,
-                    &valid_hashes,
-                    prefix_cache,
-                    raw_matched_blocks,
-                    last_hash,
-                );
-                if raw_matched_blocks > 0 && matched_blocks == 0 {
-                    tracing::info!(
-                        "Prefix cache mamba-state miss seq {} (raw {} blocks matched, but no compatible mamba snapshot)",
-                        seq.deref().deref().get_id(),
-                        raw_matched_blocks
-                    );
-                }
-                if matched_blocks > 0 {
-                    let mut matched_hash = None;
-                    if let Some(hash) = last_hash {
-                        let hashes = prefix_cache.hashes_for_match(hash);
-                        if hashes.len() >= matched_blocks {
-                            matched_hash = Some(hashes[matched_blocks - 1]);
-                        } else {
-                            matched_blocks = 0;
-                        }
-                    } else {
-                        matched_blocks = 0;
-                    }
-                    seq.deref_mut().set_mamba_prefix_hash(matched_hash);
-                } else {
-                    seq.deref_mut().set_mamba_prefix_hash(None);
-                }
-
                 cached_tokens = matched_blocks * block_size;
                 if matched_blocks > 0 {
                     tracing::info!(
@@ -810,7 +538,7 @@ impl BlockEngine {
                         matched_blocks
                     );
                 } else {
-                    tracing::info!("Prefix cache miss seq {}", seq.deref().deref().get_id());
+                    tracing::debug!("Prefix cache miss seq {}", seq.deref().deref().get_id());
                 }
                 if matched_blocks > 0 {
                     let mut blocks = prefix_cache.blocks_for_match(last_hash.unwrap());
@@ -832,8 +560,6 @@ impl BlockEngine {
             seq.deref_mut().set_num_cached_tokens(cached_tokens);
             let table = block_table.clone();
             if idx > 0 {
-                let hash = (*seqs[0]).deref().get_mamba_prefix_hash();
-                seq.deref_mut().set_mamba_prefix_hash(hash);
                 for block in &table {
                     block.deref_mut().refcount += 1;
                 }
@@ -869,7 +595,7 @@ mod tests {
         tokens: Vec<u32>,
     ) -> (SequenceGroup, Arc<Sequence>) {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
-            &tokens, seq_id, block_size, None,
+            &tokens, seq_id, block_size,
         ))));
         let sampling_params = SamplingParams::new(
             1,
@@ -905,9 +631,10 @@ mod tests {
             false,
             EncodingFormat::Float,
             EmbeddingType::Last,
-            Vec::new(),
             None,
-            false,
+            None,
+            None,
+            None,
         );
         (group, seq)
     }
@@ -924,7 +651,6 @@ mod tests {
                 enabled: true,
                 max_cached_blocks: 4,
             },
-            false,
         );
 
         let (group1, seq1) = make_group(1, 1, block_size, vec![1, 2, 3, 4, 5, 6, 7, 8]);
