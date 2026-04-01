@@ -96,8 +96,8 @@ pub enum RankData {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum TaskSampleData {
-    Token(Logprobs),
-    StopReason(String),
+    Token { seq_id: usize, logprobs: Logprobs },
+    StopReason { seq_id: usize, reason: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -105,6 +105,9 @@ pub enum MessageType {
     Start,
     Data(Vec<TaskData>),
     Sample(Vec<TaskSampleData>),
+    PromptCacheStatusRequest(Vec<usize>),
+    PromptCacheStatusReply(Vec<(usize, usize, bool)>),
+    MambaPromptFallback(Vec<usize>),
     Continue,
     Abort(Vec<usize>),
     Finish,
@@ -217,7 +220,12 @@ impl DaemonManager {
         streams: &mut Vec<LocalStream>,
         message: &MessageType,
     ) -> std::io::Result<()> {
-        let serialized = bincode::serialize(message).expect("Serialization failed");
+        let serialized = bincode::serialize(message).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("local IPC serialize failed: {e}"),
+            )
+        })?;
         for stream in streams.iter_mut() {
             stream.write_all(&(serialized.len() as u32).to_le_bytes())?;
             stream.write_all(&serialized)?;
@@ -239,7 +247,12 @@ impl DaemonManager {
     //intra-node communication
     #[cfg(feature = "mpi")]
     pub fn send_mpi(&self, message: &MessageType) -> std::io::Result<()> {
-        let serialized = bincode::serialize(message).expect("Serialization failed");
+        let serialized = bincode::serialize(message).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("mpi serialize failed: {e}"),
+            )
+        })?;
         let msg_len = serialized.len() as u64;
 
         let world = self.mpi_world.as_ref().unwrap();
@@ -282,9 +295,15 @@ impl DaemonManager {
 
         let mut serialized = vec![0u8; length];
         stream.read_exact(&mut serialized)?;
-        let message: MessageType =
-            bincode::deserialize(&serialized).expect("Deserialization failed");
-        // Send acknowledgment
+        let message: MessageType = bincode::deserialize(&serialized).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "local IPC deserialize failed ({} bytes): {e}",
+                    serialized.len()
+                ),
+            )
+        })?;
         stream.write_all(&[1])?;
         stream.flush()?;
         Ok(message)
@@ -303,8 +322,12 @@ impl DaemonManager {
         let mut serialized = vec![0u8; msg_len];
         world.broadcast_into(0, &mut serialized[..]);
 
-        let message: MessageType =
-            bincode::deserialize(&serialized).expect("Deserialization failed");
+        let message: MessageType = bincode::deserialize(&serialized).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("mpi deserialize failed ({} bytes): {e}", serialized.len()),
+            )
+        })?;
         Ok(message)
     }
 
@@ -326,6 +349,50 @@ impl DaemonManager {
             );
             DaemonManager::receive_local(self.main_stream.as_mut().unwrap())
         }
+    }
+
+    pub fn send_to_main(&mut self, message: &MessageType) -> std::io::Result<()> {
+        assert!(
+            DaemonManager::is_daemon(),
+            "must be called in the daemon processes!"
+        );
+        assert!(
+            self.main_stream.is_some(),
+            "not connected to the main process!"
+        );
+        let stream = self.main_stream.as_mut().unwrap();
+        let serialized = bincode::serialize(message).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("local IPC serialize failed: {e}"),
+            )
+        })?;
+        stream.write_all(&(serialized.len() as u32).to_le_bytes())?;
+        stream.write_all(&serialized)?;
+        stream.flush()?;
+        let mut ack_buf = [0u8; 1];
+        stream.read_exact(&mut ack_buf)?;
+        if ack_buf[0] != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unexpected acknowledgment value from main process",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn receive_from_daemons(&mut self) -> std::io::Result<Vec<MessageType>> {
+        assert!(
+            !DaemonManager::is_daemon(),
+            "must be called in the main process!"
+        );
+        assert!(self.daemon_streams.is_some(), "No daemon process found!");
+        let streams = self.daemon_streams.as_mut().unwrap();
+        let mut messages = Vec::with_capacity(streams.len());
+        for stream in streams.iter_mut() {
+            messages.push(DaemonManager::receive_local(stream)?);
+        }
+        Ok(messages)
     }
 
     //inter-node communication

@@ -9,6 +9,7 @@ pub mod block_engine;
 /// actually allocates the KV cache for the CPU and GPU. It is used by the LLMEngine to execute
 /// operations issued by the scheduler.
 pub mod cache_engine;
+pub mod mamba;
 pub mod prefix_cache;
 pub mod sequence;
 use tracing::warn;
@@ -20,12 +21,13 @@ type SrcBlockFrom = usize;
 type DstBlocksTo = Vec<usize>;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use crate::scheduler::{block_engine::AllocStatus, sequence::SequenceStatus};
 
+use self::mamba::MambaState;
 use self::{
     block_engine::BlockEngine, cache_engine::CacheConfig, prefix_cache::PrefixCacheConfig,
     sequence::SequenceGroup,
@@ -62,11 +64,16 @@ pub struct Scheduler {
     swapped_out: VecDeque<Arc<SequenceGroup>>,
     config: SchedulerConfig,
     pub block_engine: BlockEngine,
+    mamba_state: MambaState,
     is_last_prefill: bool,
 }
 
 impl Scheduler {
-    pub fn new(config: SchedulerConfig, cache_config: &CacheConfig) -> Self {
+    pub fn new(
+        config: SchedulerConfig,
+        cache_config: &CacheConfig,
+        require_mamba_prefix_snapshots: bool,
+    ) -> Self {
         assert!(cache_config.fully_init);
         let prefix_cache_cfg = config.prefix_cache.clone();
         Self {
@@ -80,7 +87,9 @@ impl Scheduler {
                 cache_config.num_cpu_blocks.unwrap(),
                 cache_config.kvcache_mem_gpu,
                 prefix_cache_cfg,
+                require_mamba_prefix_snapshots,
             ),
+            mamba_state: MambaState::default(),
             is_last_prefill: false,
         }
     }
@@ -238,8 +247,16 @@ impl Scheduler {
         !self.running.is_empty() || !self.waiting.is_empty()
     }
 
-    pub fn free_finished_sequence_groups(&mut self) {
+    pub fn free_finished_sequence_groups(&mut self) -> Vec<usize> {
+        self.free_finished_sequence_groups_with(|_, _, _| {})
+    }
+
+    pub fn free_finished_sequence_groups_with<F>(&mut self, mut on_finished: F) -> Vec<usize>
+    where
+        F: FnMut(usize, Option<u64>, Option<usize>),
+    {
         let mut to_free = Vec::new();
+        let mut released_ids = Vec::new();
         let clone = self.running.clone();
         self.running = clone
             .iter()
@@ -254,8 +271,21 @@ impl Scheduler {
             .cloned()
             .collect::<VecDeque<_>>();
         for group in to_free {
+            for seq in group.get_seqs().values() {
+                let seq_id = seq.deref().get_id();
+                let full_blocks = seq.deref().get_len() / self.block_engine.get_block_size();
+                let block_id = self
+                    .block_engine
+                    .prefix_block_id_for_sequence(seq, full_blocks);
+                let hash = self
+                    .block_engine
+                    .prefix_hash_for_sequence(seq, seq.deref().get_len());
+                on_finished(seq_id, hash, block_id);
+                released_ids.push(seq_id);
+            }
             self._free(&group, true);
         }
+        released_ids
     }
 
     pub fn prefix_cache_enabled(&self) -> bool {
@@ -376,6 +406,47 @@ impl Scheduler {
             .map(|&i| Arc::clone(&scheduled[i as usize]))
             .collect();
         (finished_indices, finished_groups)
+    }
+
+    pub fn abort_sequences(&mut self, seq_ids: &[usize]) -> Vec<usize> {
+        if seq_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let seq_id_set = seq_ids.iter().copied().collect::<HashSet<_>>();
+        let groups_to_abort = self
+            .waiting
+            .iter()
+            .chain(self.running.iter())
+            .chain(self.swapped_out.iter())
+            .filter(|group| {
+                group
+                    .get_seqs()
+                    .values()
+                    .any(|seq| seq_id_set.contains(&seq.deref().get_id()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut aborted_seq_ids = Vec::new();
+        let mut aborted_group_ids = HashSet::new();
+        for group in groups_to_abort {
+            if !aborted_group_ids.insert(*group.get_id()) {
+                continue;
+            }
+
+            for seq in group.get_seqs().values() {
+                let seq_id = seq.deref().get_id();
+                if seq_id_set.contains(&seq_id) {
+                    aborted_seq_ids.push(seq_id);
+                }
+            }
+            self._abort_seq_group(&group);
+        }
+
+        aborted_seq_ids.sort_unstable();
+        aborted_seq_ids.dedup();
+        aborted_seq_ids
     }
 }
 

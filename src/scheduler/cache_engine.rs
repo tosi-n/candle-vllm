@@ -15,6 +15,7 @@ pub struct CacheConfig {
     pub fully_init: bool,
     pub dtype: DType,
     pub kvcache_mem_gpu: usize, // in MB
+    pub mamba_cache_budget_bytes: usize,
 }
 
 impl CacheConfig {
@@ -64,7 +65,7 @@ impl CacheEngine {
                 &Device::Cpu,
                 num_shards,
             )?,
-            num_layers: model_config.num_hidden_layers,
+            num_layers: model_config.kv_cache_num_layers(),
         })
     }
 
@@ -93,7 +94,7 @@ impl CacheEngine {
             cache_config.num_gpu_blocks.unwrap_or(32)
         };
 
-        if cfg!(feature = "flash-decoding") {
+        if cfg!(any(feature = "flashattn", feature = "flashinfer")) {
             let kv_shape = Self::calculate_flash_key_value_block_shape(
                 model_config,
                 cache_config.block_size,
@@ -101,7 +102,7 @@ impl CacheEngine {
             );
 
             let mut cache = Vec::new();
-            for _ in 0..model_config.num_hidden_layers {
+            for _ in 0..model_config.kv_cache_num_layers() {
                 let key_blocks = Tensor::zeros(
                     (num_blocks, kv_shape.0, kv_shape.1, kv_shape.2),
                     dtype,
@@ -137,7 +138,7 @@ impl CacheEngine {
             );
 
             let mut cache = Vec::new();
-            for _ in 0..model_config.num_hidden_layers {
+            for _ in 0..model_config.kv_cache_num_layers() {
                 let key_blocks = Tensor::zeros(
                     (num_blocks, kshape.0, kshape.1, kshape.2, kshape.3),
                     dtype,

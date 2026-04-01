@@ -2,11 +2,43 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub const EMPTY_TOOL_RESULT_ACK: &str = "Tool executed successfully with no textual output.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ImageUrlContent {
+    Url(String),
+    Object {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MessageContent {
+    #[serde(alias = "input_text", alias = "text")]
+    Text { text: String },
+    #[serde(alias = "image_url")]
+    ImageUrl { image_url: ImageUrlContent },
+    #[serde(alias = "image_base64")]
+    ImageBase64 { image_base64: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContentType {
+    PureText(String),
+    Single(MessageContent),
+    Multi(Vec<MessageContent>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<MessageContentType>,
     #[serde(default)]
     pub tool_calls: Option<Vec<crate::tools::ToolCall>>,
     #[serde(default)]
@@ -21,11 +53,53 @@ pub enum Messages {
     Literal(String),
 }
 
+fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
+    match content {
+        Some(MessageContentType::PureText(text)) => text.clone(),
+        Some(MessageContentType::Single(item)) => match item {
+            MessageContent::Text { text } => text.clone(),
+            _ => String::new(),
+        },
+        Some(MessageContentType::Multi(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => String::new(),
+    }
+}
+
+pub fn normalize_empty_openai_tool_results(messages: &mut [ChatMessage]) {
+    for msg in messages {
+        if msg.role != "tool" {
+            continue;
+        }
+
+        let is_empty = extract_text_from_content(msg.content.as_ref())
+            .trim()
+            .is_empty();
+        if is_empty {
+            msg.content = Some(MessageContentType::PureText(
+                EMPTY_TOOL_RESULT_ACK.to_string(),
+            ));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StopTokens {
     Multi(Vec<String>),
     Single(String),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +116,8 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopTokens>,
     #[serde(default)]
     pub stream: Option<bool>, //false
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub presence_penalty: Option<f32>, //0.0
     pub repeat_last_n: Option<usize>, //0.0
@@ -105,6 +181,7 @@ impl Default for ChatCompletionRequest {
             max_tokens: None,
             stop: None,
             stream: None,
+            stream_options: None,
             presence_penalty: None,
             repeat_last_n: None,
             frequency_penalty: None,
@@ -178,5 +255,28 @@ pub struct EmbeddingRequest {
 impl Default for EncodingFormat {
     fn default() -> Self {
         Self::Float
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatCompletionRequest;
+
+    #[test]
+    fn chat_completion_request_reads_stream_options() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.stream, Some(true));
+        assert_eq!(
+            request.stream_options.map(|options| options.include_usage),
+            Some(true)
+        );
     }
 }

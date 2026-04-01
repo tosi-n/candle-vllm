@@ -28,25 +28,23 @@ impl GLM4 {
                 .num_key_value_heads
                 .unwrap_or(config.num_attention_heads),
         );
-        config.max_seq_len = config.max_position_embeddings.unwrap_or(32768);
+        config.max_seq_len =
+            if config.max_position_embeddings.is_some() || config.rope_scaling.is_some() {
+                config.effective_max_seq_len()
+            } else {
+                32768
+            };
         config.attention_bias = Some(config.attention_bias.unwrap_or(false));
         config.bos_token_id = Some(
             config
                 .bos_token_id
                 .unwrap_or(super::TokenID(either::Either::Left(Some(128256)))),
         );
-        if config.quantization_config.is_some() {
-            config.quant = Some(
-                config
-                    .quantization_config
-                    .as_ref()
-                    .unwrap()
-                    .quant_method
-                    .clone(),
-            );
-        } else if isq.is_some() {
-            config.quant = Some(isq.unwrap().to_string());
-        }
+        config.isq_quant = if config.quantization_config.is_some() {
+            None
+        } else {
+            isq
+        };
         Ok(config)
     }
 }
@@ -66,7 +64,7 @@ impl MLP {
             2,
             vb.pp("gate_up_proj"),
             comm.clone(),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 
@@ -76,7 +74,7 @@ impl MLP {
             false,
             vb.pp("down_proj"),
             comm,
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 

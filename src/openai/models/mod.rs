@@ -1,11 +1,13 @@
 pub mod deepseek;
 pub mod gemma;
 pub mod gemma3;
+pub mod gemma3_vl;
 pub mod glm4;
 pub mod layers;
 pub mod linear;
 pub mod llama;
 pub mod mistral;
+pub mod mistral3_vl;
 pub mod phi2;
 pub mod phi4;
 pub mod quantized_glm4;
@@ -14,8 +16,12 @@ pub mod quantized_phi3;
 pub mod quantized_qwen;
 pub mod quantized_qwen3_moe;
 pub mod qwen;
+pub mod qwen3_5;
+pub mod qwen3_5_moe;
 pub mod qwen3_moe;
+pub mod qwen3_vl;
 pub mod stable_lm;
+pub mod utils;
 pub mod yi;
 use crate::openai::distributed::Comm;
 use crate::{InputMetadata, PagedAttention};
@@ -45,6 +51,14 @@ pub struct TokenID(
 #[derive(Deserialize, PartialEq, Debug, Clone)]
 pub struct QuantConfig {
     pub quant_method: String,
+    #[serde(default)]
+    pub activation_scheme: Option<String>,
+    #[serde(default)]
+    pub weight_per_tensor: Option<bool>,
+    #[serde(default)]
+    pub act_per_tensor: Option<bool>,
+    #[serde(default)]
+    pub modules_to_not_convert: Option<Vec<String>>,
     #[serde(default)]
     pub bits: usize,
     #[serde(default)]
@@ -106,6 +120,7 @@ pub struct QwenMoEConfig {
     #[serde(default)]
     pub norm_topk_prob: bool,
     pub num_experts_per_tok: usize,
+    pub routed_scaling_factor: Option<f64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -158,6 +173,13 @@ pub struct ModelArchConfig {
     pub architectures: Option<ModelArch>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+struct MultiModalArchConfig {
+    pub architectures: Option<Vec<String>>,
+    pub text_config: Option<serde_json::Value>,
+    pub vision_config: Option<serde_json::Value>,
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! serde_default_cfg {
@@ -171,12 +193,18 @@ serde_default_cfg!(usize, max_seq_len, 8192);
 serde_default_cfg!(bool, tie_word_embeddings, false);
 serde_default_cfg!(f64, rope_theta, 10_000.0f64);
 serde_default_cfg!(bool, qk_layernorm, false);
+serde_default_cfg!(usize, intermediate_size, 0);
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub architectures: Option<Vec<String>>,
     pub hidden_size: usize,
     pub head_dim: Option<usize>,
+    #[serde(
+        default = "intermediate_size",
+        alias = "ffn_hidden_size",
+        alias = "feed_forward_length"
+    )]
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
@@ -187,7 +215,7 @@ pub struct Config {
     pub rope_theta: f64,
     pub rope_local_base_freq: Option<f64>,
     pub bos_token_id: Option<TokenID>,
-    pub eos_token_id: TokenID,
+    pub eos_token_id: Option<TokenID>,
     #[serde(default = "max_seq_len")]
     pub max_seq_len: usize,
     pub original_max_position_embeddings: Option<usize>,
@@ -197,28 +225,218 @@ pub struct Config {
     pub hidden_activation: Option<candle_nn::Activation>,
     #[serde(default = "tie_word_embeddings")]
     pub tie_word_embeddings: bool,
+    #[serde(alias = "rope_parameters")]
     pub rope_scaling: Option<HashMap<String, ScalingValue>>,
     pub max_position_embeddings: Option<usize>,
     pub attention_bias: Option<bool>,
     pub partial_rotary_factor: Option<f32>,
     #[serde(default = "qk_layernorm")]
     pub qk_layernorm: bool,
+    #[serde(alias = "qkv_bias")]
     pub use_qkv_bias: Option<bool>,
     pub custom_stop_tokens: Option<Vec<String>>,
     pub attn_logit_softcapping: Option<f64>,
     pub final_logit_softcapping: Option<f64>,
     pub moe_config: Option<MoEConfig>,
     pub quantization_config: Option<QuantConfig>,
-    pub quant: Option<String>,
+    pub isq_quant: Option<String>,
     pub fp8_kvcache: Option<bool>,
+    pub extra_config_json: Option<String>,
 }
 
 impl Config {
+    pub fn derive_yarn_parameters(factor: f64) -> (f64, f64, f64, f64) {
+        let factor = factor.max(1.0);
+
+        let beta_fast = if factor <= 4.0 {
+            32.0
+        } else {
+            32.0 * (factor / 4.0).sqrt()
+        };
+        let beta_slow = 1.0;
+        let extrapolation_factor = if factor > 8.0 {
+            1.0 + 0.05 * (factor - 8.0).sqrt()
+        } else {
+            1.0
+        };
+        let attn_factor = 1.0;
+
+        (beta_fast, beta_slow, extrapolation_factor, attn_factor)
+    }
+
+    fn base_max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings.unwrap_or(self.max_seq_len)
+    }
+
+    pub fn apply_static_rope_scaling(
+        yarn_scaling_factor: Option<f64>,
+        max_position_embeddings: usize,
+    ) -> Option<HashMap<String, ScalingValue>> {
+        if let Some(factor) = yarn_scaling_factor {
+            let (beta_fast, beta_slow, extrapolation_factor, attn_factor) =
+                Self::derive_yarn_parameters(factor);
+
+            return Some(HashMap::from([
+                (
+                    "rope_type".to_string(),
+                    ScalingValue::String("yarn".to_string()),
+                ),
+                ("factor".to_string(), ScalingValue::Single(factor)),
+                (
+                    "original_max_position_embeddings".to_string(),
+                    ScalingValue::Single(max_position_embeddings as f64),
+                ),
+                ("beta_fast".to_string(), ScalingValue::Single(beta_fast)),
+                ("beta_slow".to_string(), ScalingValue::Single(beta_slow)),
+                (
+                    "extrapolation_factor".to_string(),
+                    ScalingValue::Single(extrapolation_factor),
+                ),
+                ("attn_factor".to_string(), ScalingValue::Single(attn_factor)),
+            ]));
+        }
+
+        None
+    }
+
+    pub fn effective_max_seq_len(&self) -> usize {
+        let base_max_position_embeddings = self.base_max_position_embeddings();
+        let Some(rope_scaling) = &self.rope_scaling else {
+            return base_max_position_embeddings;
+        };
+
+        let rope_type = rope_scaling
+            .get("rope_type")
+            .or_else(|| rope_scaling.get("type"))
+            .and_then(|value| match value {
+                ScalingValue::String(value) => Some(value.as_str()),
+                _ => None,
+            });
+        let factor = rope_scaling.get("factor").and_then(|value| match value {
+            ScalingValue::Single(value) => Some(*value),
+            _ => None,
+        });
+        let original_max_position_embeddings = rope_scaling
+            .get("original_max_position_embeddings")
+            .and_then(|value| match value {
+                ScalingValue::Single(value) => Some(*value),
+                _ => None,
+            })
+            .or_else(|| {
+                self.original_max_position_embeddings
+                    .map(|value| value as f64)
+            });
+
+        match (rope_type, factor, original_max_position_embeddings) {
+            (Some("yarn"), Some(factor), Some(original_max_position_embeddings))
+                if factor > 1.0 =>
+            {
+                std::cmp::max(
+                    base_max_position_embeddings,
+                    (original_max_position_embeddings * factor).round() as usize,
+                )
+            }
+            _ => base_max_position_embeddings,
+        }
+    }
+
+    pub fn apply_runtime_rope_overrides(&mut self, yarn_scaling_factor: Option<f64>) {
+        if let Some(scaling) = Self::apply_static_rope_scaling(
+            yarn_scaling_factor,
+            self.base_max_position_embeddings(),
+        ) {
+            self.rope_scaling = Some(scaling);
+        }
+
+        self.apply_rope_overrides();
+        self.max_seq_len = self.effective_max_seq_len();
+    }
+
+    fn apply_rope_overrides(&mut self) {
+        if let Some(scaling) = &self.rope_scaling {
+            if let Some(ScalingValue::Single(v)) = scaling.get("rope_theta") {
+                self.rope_theta = *v;
+            }
+            if let Some(ScalingValue::Single(v)) = scaling.get("partial_rotary_factor") {
+                self.partial_rotary_factor = Some(*v as f32);
+            }
+            if let Some(ScalingValue::Single(v)) = scaling.get("original_max_position_embeddings") {
+                self.original_max_position_embeddings = Some(*v as usize);
+            }
+        }
+        if let Some(raw) = self.extra_config_json.as_ref() {
+            if let Ok(root) = serde_json::from_str::<serde_json::Value>(raw) {
+                let cfg_root = root.get("text_config").unwrap_or(&root);
+                if let Some(rope_params) = cfg_root
+                    .get("rope_parameters")
+                    .or_else(|| cfg_root.get("rope_scaling"))
+                {
+                    if let Some(v) = rope_params.get("rope_theta").and_then(|v| v.as_f64()) {
+                        self.rope_theta = v;
+                    }
+                    if let Some(v) = rope_params
+                        .get("partial_rotary_factor")
+                        .and_then(|v| v.as_f64())
+                    {
+                        self.partial_rotary_factor = Some(v as f32);
+                    }
+                    if let Some(v) = rope_params
+                        .get("original_max_position_embeddings")
+                        .and_then(|v| v.as_u64())
+                    {
+                        self.original_max_position_embeddings = Some(v as usize);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn load_config(filename: PathBuf) -> Result<Config> {
-        match std::fs::read(filename) {
+        match std::fs::read(filename.clone()) {
             Ok(f) => {
-                let config: Config =
-                    serde_json::from_slice(&f).map_err(candle_core::Error::wrap)?;
+                let raw = String::from_utf8(f.clone()).map_err(candle_core::Error::wrap)?;
+                let top_level_quant_config = serde_json::from_slice::<serde_json::Value>(&f)
+                    .ok()
+                    .and_then(|root| root.get("quantization_config").cloned())
+                    .and_then(|v| serde_json::from_value::<QuantConfig>(v).ok());
+                let mut config: Config =
+                    if let Ok(mm_cfg) = serde_json::from_slice::<MultiModalArchConfig>(&f) {
+                        if mm_cfg.text_config.is_some() && mm_cfg.vision_config.is_some() {
+                            let mut cfg: Config =
+                                serde_json::from_value(mm_cfg.text_config.clone().unwrap())
+                                    .map_err(candle_core::Error::wrap)?;
+                            cfg.architectures = mm_cfg.architectures.clone().or(cfg.architectures);
+                            // For multimodal configs, quantization_config (including modules_to_not_convert)
+                            // is usually defined at top level rather than under text_config.
+                            if let Some(qcfg) = top_level_quant_config.clone() {
+                                cfg.quantization_config = Some(qcfg);
+                            }
+                            cfg
+                        } else {
+                            match serde_json::from_slice::<Config>(&f) {
+                                Ok(cfg) => cfg,
+                                Err(root_err) => {
+                                    if let Some(text_cfg) = mm_cfg.text_config {
+                                        let mut cfg: Config = serde_json::from_value(text_cfg)
+                                            .map_err(candle_core::Error::wrap)?;
+                                        cfg.architectures =
+                                            mm_cfg.architectures.clone().or(cfg.architectures);
+                                        if let Some(qcfg) = top_level_quant_config.clone() {
+                                            cfg.quantization_config = Some(qcfg);
+                                        }
+                                        cfg
+                                    } else {
+                                        return Err(candle_core::Error::wrap(root_err));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        serde_json::from_slice(&f).map_err(candle_core::Error::wrap)?
+                    };
+                config.extra_config_json = Some(raw);
+                config.apply_rope_overrides();
+                config.max_seq_len = config.effective_max_seq_len();
                 Ok(config)
             }
             Err(e) => panic!(
@@ -256,6 +474,215 @@ impl Config {
                 e
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, ScalingValue};
+    use std::collections::HashMap;
+
+    fn test_config(max_position_embeddings: usize) -> Config {
+        Config {
+            architectures: Some(vec!["Qwen2ForCausalLM".to_string()]),
+            hidden_size: 4096,
+            head_dim: Some(128),
+            intermediate_size: 11008,
+            vocab_size: 151936,
+            num_hidden_layers: 32,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(32),
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_local_base_freq: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            max_seq_len: max_position_embeddings,
+            original_max_position_embeddings: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            hidden_act: None,
+            hidden_activation: None,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            max_position_embeddings: Some(max_position_embeddings),
+            attention_bias: None,
+            partial_rotary_factor: None,
+            qk_layernorm: false,
+            use_qkv_bias: None,
+            custom_stop_tokens: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            moe_config: None,
+            quantization_config: None,
+            isq_quant: None,
+            fp8_kvcache: None,
+            extra_config_json: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_max_seq_len_scales_yarn_context() {
+        let mut config = test_config(262_144);
+        config.rope_scaling = Some(HashMap::from([
+            (
+                "rope_type".to_string(),
+                ScalingValue::String("yarn".to_string()),
+            ),
+            ("factor".to_string(), ScalingValue::Single(4.0)),
+            (
+                "original_max_position_embeddings".to_string(),
+                ScalingValue::Single(262_144.0),
+            ),
+        ]));
+
+        assert_eq!(config.effective_max_seq_len(), 1_048_576);
+    }
+
+    #[test]
+    fn test_apply_runtime_rope_overrides_updates_effective_max_seq_len() {
+        let mut config = test_config(262_144);
+        config.apply_runtime_rope_overrides(Some(8.0));
+
+        assert_eq!(config.max_position_embeddings, Some(262_144));
+        assert_eq!(config.original_max_position_embeddings, Some(262_144));
+        assert_eq!(config.max_seq_len, 2_097_152);
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Qwen3HybridRawConfig {
+    #[serde(alias = "layer_types")]
+    pub layers_block_type: Option<Vec<String>>,
+    #[serde(alias = "linear_conv_kernel_dim")]
+    pub conv_kernel_size: Option<usize>,
+    pub full_attention_interval: Option<usize>,
+    pub linear_num_heads: Option<usize>,
+    #[serde(alias = "linear_num_key_heads")]
+    pub linear_num_key_heads: Option<usize>,
+    #[serde(alias = "linear_num_value_heads")]
+    pub linear_num_value_heads: Option<usize>,
+    pub linear_num_key_value_heads: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3HybridConfig {
+    pub layer_types: Vec<String>,
+    pub conv_kernel_size: usize,
+    pub num_v_heads: usize,
+    pub num_k_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+}
+
+pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
+    matches!(
+        arch,
+        "Qwen3_5ForCausalLM"
+            | "Qwen3_5MoeForCausalLM"
+            | "Qwen3NextForCausalLM"
+            | "Qwen3_5ForConditionalGeneration"
+            | "Qwen3_5MoeForConditionalGeneration"
+            | "Qwen3NextForConditionalGeneration"
+    )
+}
+
+fn is_qwen3_hybrid_arch(config: &Config) -> bool {
+    let arch = config.architectures.as_ref().and_then(|a| a.first());
+    arch.map(|a| is_qwen3_hybrid_arch_name(a)).unwrap_or(false)
+}
+
+fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawConfig> {
+    if !is_qwen3_hybrid_arch(config) {
+        return None;
+    }
+    let extra = config.extra_config_json.as_ref()?;
+    let root = serde_json::from_str::<serde_json::Value>(extra).ok()?;
+    let cfg = root.get("text_config").cloned().unwrap_or(root);
+    serde_json::from_value::<Qwen3HybridRawConfig>(cfg).ok()
+}
+
+pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
+    let raw_cfg = qwen3_hybrid_raw_from_extra_config(config).unwrap_or_default();
+
+    let mut layer_types = if let Some(layer_types) = raw_cfg.layers_block_type {
+        layer_types
+    } else if let Some(interval) = raw_cfg.full_attention_interval {
+        if interval > 0 {
+            (0..config.num_hidden_layers)
+                .map(|idx| {
+                    if (idx + 1) % interval == 0 {
+                        "full_attention".to_string()
+                    } else {
+                        "linear_attention".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec!["full_attention".to_string(); config.num_hidden_layers]
+        }
+    } else {
+        vec!["full_attention".to_string(); config.num_hidden_layers]
+    };
+
+    for layer_type in layer_types.iter_mut() {
+        if layer_type == "attention" {
+            *layer_type = "full_attention".to_string();
+        }
+    }
+    if layer_types.len() != config.num_hidden_layers {
+        tracing::warn!(
+            "Qwen3 hybrid layer_types length {} != num_hidden_layers {}, fallback to full_attention.",
+            layer_types.len(),
+            config.num_hidden_layers
+        );
+        layer_types = vec!["full_attention".to_string(); config.num_hidden_layers];
+    }
+
+    let num_v_heads = raw_cfg
+        .linear_num_value_heads
+        .or(raw_cfg.linear_num_heads)
+        .unwrap_or(config.num_attention_heads);
+    let num_k_heads = raw_cfg
+        .linear_num_key_heads
+        .or(raw_cfg.linear_num_key_value_heads)
+        .unwrap_or(num_v_heads);
+    let key_head_dim = raw_cfg.linear_key_head_dim.unwrap_or(
+        config
+            .head_dim
+            .unwrap_or(config.hidden_size / config.num_attention_heads),
+    );
+    let value_head_dim = raw_cfg.linear_value_head_dim.unwrap_or(key_head_dim);
+    let conv_kernel_size = raw_cfg.conv_kernel_size.unwrap_or(4);
+
+    Qwen3HybridConfig {
+        layer_types,
+        conv_kernel_size,
+        num_v_heads,
+        num_k_heads,
+        key_head_dim,
+        value_head_dim,
+    }
+}
+
+pub fn qwen3_hybrid_layer_types(config: &Config) -> Option<Vec<String>> {
+    if !is_qwen3_hybrid_arch(config) {
+        return None;
+    }
+    Some(resolve_qwen3_hybrid_config(config).layer_types)
+}
+
+impl Config {
+    pub fn kv_cache_num_layers(&self) -> usize {
+        if let Some(layer_types) = qwen3_hybrid_layer_types(self) {
+            return layer_types
+                .iter()
+                .filter(|lt| lt.as_str() == "full_attention")
+                .count();
+        }
+        self.num_hidden_layers
     }
 
     pub fn get_head_size(&self) -> usize {

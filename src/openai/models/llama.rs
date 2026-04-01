@@ -25,19 +25,12 @@ impl Llama {
                 .num_key_value_heads
                 .unwrap_or(config.num_attention_heads),
         );
-        config.max_seq_len = config.max_position_embeddings.unwrap_or(config.max_seq_len);
-        if config.quantization_config.is_some() {
-            config.quant = Some(
-                config
-                    .quantization_config
-                    .as_ref()
-                    .unwrap()
-                    .quant_method
-                    .clone(),
-            );
-        } else if isq.is_some() {
-            config.quant = Some(isq.unwrap().to_string());
-        }
+        config.max_seq_len = config.effective_max_seq_len();
+        config.isq_quant = if config.quantization_config.is_some() {
+            None
+        } else {
+            isq
+        };
         Ok(config)
     }
 }

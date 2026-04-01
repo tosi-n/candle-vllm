@@ -6,6 +6,7 @@ use crate::openai::distributed::{
     embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear, VarBuilder,
 };
+use crate::openai::models::layers::deepstack::ApplyDeepStack;
 use crate::openai::models::layers::moe::{FusedMoe, FusedMoeFp8, FusedMoeISQ};
 use crate::openai::models::linear::LinearX as Linear;
 use crate::openai::models::mask::get_attention_causal_mask;
@@ -15,7 +16,6 @@ use candle_core as candle;
 
 use candle_nn::RmsNorm;
 use parking_lot::RwLock;
-use std::iter::zip;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,29 +33,48 @@ impl Qwen3MoE {
                 .num_key_value_heads
                 .unwrap_or(config.num_attention_heads),
         );
-        config.max_seq_len = config.max_position_embeddings.unwrap_or(config.max_seq_len);
-        config.attention_bias = Some(config.attention_bias.unwrap_or(true));
-        if config.quantization_config.is_some() {
-            config.quant = Some(
-                config
-                    .quantization_config
-                    .as_ref()
-                    .unwrap()
-                    .quant_method
-                    .clone(),
-            );
-        } else if isq.is_some() {
-            config.quant = Some(isq.unwrap().to_string());
+        config.max_seq_len = config.effective_max_seq_len();
+        config.attention_bias = Some(
+            config
+                .use_qkv_bias
+                .or(config.attention_bias)
+                .unwrap_or(true),
+        );
+        config.isq_quant = if config.quantization_config.is_some() {
+            None
+        } else {
+            isq
+        };
+
+        if config.moe_config.is_none() {
+            let f = std::fs::read(filename).map_err(candle::Error::wrap)?;
+            let mut from_root: Option<QwenMoEConfig> =
+                serde_json::from_slice::<QwenMoEConfig>(&f).ok();
+            if from_root.is_none() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&f) {
+                    if let Some(text_config) = v.get("text_config") {
+                        from_root =
+                            serde_json::from_value::<QwenMoEConfig>(text_config.clone()).ok();
+                    }
+                }
+            }
+            if let Some(moe_cfg) = from_root {
+                config.moe_config = Some(MoEConfig::QwenMoE(moe_cfg));
+            }
         }
 
-        match std::fs::read(filename) {
-            Ok(f) => {
-                let cfg: QwenMoEConfig =
-                    serde_json::from_slice(&f).map_err(candle_core::Error::wrap)?;
-                config.moe_config = Some(MoEConfig::QwenMoE(cfg));
+        // If config omits norm_topk_prob, align with existing GGUF fallback behavior.
+        if let Some(MoEConfig::QwenMoE(moe_cfg)) = config.moe_config.as_mut() {
+            if let Some(raw) = config.extra_config_json.as_ref() {
+                if let Ok(root) = serde_json::from_str::<serde_json::Value>(raw) {
+                    let cfg_root = root.get("text_config").unwrap_or(&root);
+                    if cfg_root.get("norm_topk_prob").is_none() {
+                        moe_cfg.norm_topk_prob = moe_cfg.shared_expert_intermediate_size.is_none();
+                    }
+                }
             }
-            Err(e) => panic!("Unable to load MoE config from file {:?}!", e),
         }
+
         Ok(config)
     }
 }
@@ -78,7 +97,7 @@ impl Mlp {
             false,
             vb.pp("gate_proj"),
             comm.clone(),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
         let up_proj = TensorParallelColumnLinear::load_with_hints(
@@ -87,7 +106,7 @@ impl Mlp {
             false,
             vb.pp("up_proj"),
             comm.clone(),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
         let down_proj = TensorParallelRowLinear::load_with_hints(
@@ -96,7 +115,7 @@ impl Mlp {
             false,
             vb.pp("down_proj"),
             comm,
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
         Ok(Self {
@@ -184,7 +203,7 @@ impl DecoderLayer {
                         dtype,
                         quant_cfg,
                     )?)
-                } else if cfg.quant.is_some() {
+                } else if cfg.isq_quant.is_some() {
                     MoeOrMlp::FusedMoeISQ(FusedMoeISQ::new(
                         cfg,
                         vb.pp("mlp").clone(),
@@ -199,7 +218,7 @@ impl DecoderLayer {
                         dtype,
                     )?)
                 }
-            } else if cfg.quant.is_some() {
+            } else if cfg.isq_quant.is_some() {
                 MoeOrMlp::FusedMoeISQ(FusedMoeISQ::new(
                     cfg,
                     vb.pp("mlp").clone(),
@@ -312,6 +331,7 @@ pub struct Qwen3MoE {
     device: Device,
     dtype: DType,
     cfg: Config,
+    vocab_size: usize,
 }
 
 impl Qwen3MoE {
@@ -323,7 +343,27 @@ impl Qwen3MoE {
         comm: Rc<Comm>,
         progress_reporter: Arc<RwLock<ProgressReporter>>,
     ) -> Result<Self> {
-        let vb_m = vb.pp("model");
+        Self::new_with_prefix(vb, cfg, dtype, device, comm, progress_reporter, None)
+    }
+
+    pub fn new_with_prefix(
+        vb: VarBuilder,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+        comm: Rc<Comm>,
+        progress_reporter: Arc<RwLock<ProgressReporter>>,
+        prefix: Option<String>,
+    ) -> Result<Self> {
+        let (vb_m, tie_word_embeddings) = if let Some(prefix) = prefix {
+            (vb.pp(prefix.trim_end_matches('.')), cfg.tie_word_embeddings)
+        } else if !vb.contains_tensor("model.embed_tokens.weight")
+            && vb.contains_tensor("embed_tokens.weight")
+        {
+            (vb.clone(), true)
+        } else {
+            (vb.pp("model"), cfg.tie_word_embeddings)
+        };
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -345,7 +385,7 @@ impl Qwen3MoE {
         let lm_head = ReplicatedLinear::load_no_bias(
             cfg.hidden_size,
             cfg.vocab_size,
-            if cfg.tie_word_embeddings {
+            if tie_word_embeddings {
                 vb_m.pp("embed_tokens")
             } else {
                 vb.pp("lm_head")
@@ -361,7 +401,12 @@ impl Qwen3MoE {
             device: device.clone(),
             dtype,
             cfg: cfg.clone(),
+            vocab_size: cfg.vocab_size,
         })
+    }
+
+    pub fn embed_forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
     }
 
     pub fn forward(
@@ -371,7 +416,16 @@ impl Qwen3MoE {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        self.forward_inner(input_ids, input_positions, kv_caches, input_metadata, false)
+        self.forward_inner(
+            input_ids,
+            input_positions,
+            kv_caches,
+            input_metadata,
+            false,
+            &None,
+            &None,
+            false,
+        )
     }
 
     pub fn forward_embedding(
@@ -381,7 +435,16 @@ impl Qwen3MoE {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        self.forward_inner(input_ids, input_positions, kv_caches, input_metadata, true)
+        self.forward_inner(
+            input_ids,
+            input_positions,
+            kv_caches,
+            input_metadata,
+            false,
+            &None,
+            &None,
+            true,
+        )
     }
 
     fn forward_inner(
@@ -390,15 +453,20 @@ impl Qwen3MoE {
         input_positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
+        embedded_inputs: bool,
+        visual_pos_masks: &Option<Tensor>,
+        deepstack_visual_embeds: &Option<Vec<Tensor>>,
         return_hidden: bool,
     ) -> Result<Tensor> {
-        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
+        let seqlens = if let Some(seqlens) = input_metadata.seqlens.as_ref() {
+            seqlens.clone()
+        } else if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
                 .cu_seqlens_q
                 .as_ref()
                 .unwrap()
                 .to_vec1::<u32>()?[1..]
-                .into()
+                .to_vec()
         } else {
             Vec::new()
         };
@@ -410,27 +478,33 @@ impl Qwen3MoE {
             self.cfg.sliding_window,
             input_metadata.is_prefill,
         );
-        let mut xs = self.embed_tokens.forward(input_ids)?;
-
-        if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
-                xs = layer.forward(
-                    &xs,
-                    attention_mask.as_ref(),
-                    input_positions,
-                    Some((k_cache, v_cache)),
-                    input_metadata,
-                )?
-            }
+        let mut xs = if embedded_inputs {
+            input_ids.to_owned()
         } else {
-            for layer in self.layers.iter() {
-                xs = layer.forward(
-                    &xs,
-                    attention_mask.as_ref(),
-                    input_positions,
-                    None,
-                    input_metadata,
-                )?
+            self.embed_forward(input_ids)?
+        };
+
+        let mut kv_cache_idx = 0usize;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let cache = if let Some(kv_caches) = kv_caches {
+                let c = &kv_caches[kv_cache_idx];
+                kv_cache_idx += 1;
+                Some((&c.0, &c.1))
+            } else {
+                None
+            };
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                input_positions,
+                cache,
+                input_metadata,
+            )?;
+            if let (Some(pos_mask), Some(deepstacks)) = (visual_pos_masks, deepstack_visual_embeds)
+            {
+                if idx < deepstacks.len() {
+                    xs = xs.apply_deep_stack(pos_mask, &deepstacks[idx])?;
+                }
             }
         }
 
@@ -442,9 +516,41 @@ impl Qwen3MoE {
         let xs = self.norm.forward(&xs)?;
 
         if return_hidden {
-            return Ok(xs);
+            return xs.to_dtype(DType::F32);
         }
-        self.lm_head.forward(&xs)?.to_dtype(DType::F32)
+        self.lm_head
+            .forward(&xs.to_dtype(self.dtype)?)?
+            .to_dtype(DType::F32)
+    }
+
+    pub fn forward_with_deepstack(
+        &self,
+        input_ids: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embedded_inputs: bool,
+        visual_pos_masks: &Option<Tensor>,
+        deepstack_visual_embeds: &Option<Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            input_ids,
+            input_positions,
+            kv_caches,
+            input_metadata,
+            embedded_inputs,
+            visual_pos_masks,
+            deepstack_visual_embeds,
+            false,
+        )
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn get_vocab_size(&self) -> usize {
+        self.vocab_size
     }
 
     pub fn get_config(&self) -> &Config {
