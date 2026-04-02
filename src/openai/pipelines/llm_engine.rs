@@ -653,7 +653,33 @@ impl LLMEngine {
                     continue;
                 }
 
-                let selected_adapter_id = batch_groups[0].adapter_id.clone();
+                let selected_adapter_id = batch_groups[0]
+                    .get_seqs()
+                    .values()
+                    .next()
+                    .map(|seq| seq.deref().needs_prefill())
+                    .map(|needs_prefill| {
+                        if needs_prefill {
+                            batch_groups[0].adapter_id.clone()
+                        } else {
+                            batch_groups[0].resolve_decode_adapter_id()
+                        }
+                    })
+                    .unwrap_or_else(|| batch_groups[0].adapter_id.clone());
+                if std::env::var_os("CANDLE_VLLM_LORA_DEBUG").is_some() {
+                    tracing::info!(
+                        target: "lora_debug",
+                        selected_adapter = ?selected_adapter_id,
+                        is_prefill_batch = batch_groups[0]
+                            .get_seqs()
+                            .values()
+                            .next()
+                            .map(|seq| seq.deref().needs_prefill())
+                            .unwrap_or(false),
+                        batch_size = batch_groups.len(),
+                        "LLMEngine adapter batch selection"
+                    );
+                }
                 crate::openai::lora::set_active_adapter(selected_adapter_id.clone());
                 let forward_result = (|| -> Result<(Tensor, bool, String)> {
                     let e = engine.read();

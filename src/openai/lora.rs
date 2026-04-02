@@ -825,8 +825,7 @@ impl LoRAManager {
             );
         }
 
-        let mut delta = x.matmul(&a.t()?)?;
-        delta = delta.matmul(&b.t()?)?;
+        let mut delta = project_lora_delta(x, &a, &b)?;
 
         if (module.scale - 1.0).abs() > f64::EPSILON {
             let scale = Tensor::new(module.scale as f32, x.device())?.to_dtype(delta.dtype())?;
@@ -1208,6 +1207,37 @@ fn parse_lora_modules(
     }
 
     Ok(modules)
+}
+
+fn project_lora_delta(x: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let input_dims = x.dims().to_vec();
+    let input_rank = input_dims.len();
+    let input_dim = input_dims
+        .last()
+        .copied()
+        .ok_or_else(|| candle_core::Error::msg("Invalid input rank for LoRA"))?;
+    let output_dim = b.dim(0)?;
+
+    let x_2d = match input_rank {
+        1 => x.reshape((1, input_dim))?,
+        2 => x.clone(),
+        _ => {
+            let rows = input_dims[..input_rank - 1].iter().product::<usize>();
+            x.reshape((rows, input_dim))?
+        }
+    };
+
+    let delta_2d = x_2d.matmul(&a.t()?)?.matmul(&b.t()?)?;
+
+    match input_rank {
+        1 => delta_2d.reshape((output_dim,)),
+        2 => Ok(delta_2d),
+        _ => {
+            let mut output_shape = input_dims[..input_rank - 1].to_vec();
+            output_shape.push(output_dim);
+            delta_2d.reshape(output_shape.as_slice())
+        }
+    }
 }
 
 fn tensor_from_view(view: safetensors::tensor::TensorView<'_>) -> Result<Tensor> {
