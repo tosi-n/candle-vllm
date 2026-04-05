@@ -65,6 +65,7 @@ fn fp8_linear_is_prefill() -> bool {
 pub struct Linear {
     weight: Tensor,
     bias: Option<Tensor>,
+    module_name: Option<String>,
     scales: Option<Tensor>,
     qzeros: Option<Tensor>,
     g_idx: Option<Tensor>,
@@ -76,6 +77,23 @@ impl Linear {
         Self {
             weight,
             bias,
+            module_name: None,
+            scales: None,
+            qzeros: None,
+            g_idx: None,
+            workspace: None,
+        }
+    }
+
+    pub fn new_with_module_name(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        module_name: Option<String>,
+    ) -> Self {
+        Self {
+            weight,
+            bias,
+            module_name,
             scales: None,
             qzeros: None,
             g_idx: None,
@@ -124,7 +142,8 @@ impl Linear {
 //Remember use this linear layer throughout all of the models
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let w = match *x.dims() {
+        let input = x;
+        let w = match *input.dims() {
             [b1, seq_len, _, _] => {
                 if seq_len > 1 {
                     self.weight.broadcast_left((b1, seq_len))?.t()?
@@ -141,33 +160,59 @@ impl Module for Linear {
             }
             _ => self.weight.t()?,
         };
-        let x = match *x.dims() {
+        let mut out = match *input.dims() {
             [bsize, seq_len, dim1, dim2] => {
                 if seq_len > 1 {
-                    x.matmul(&w)?
+                    input.matmul(&w)?
                 } else {
                     let wdim = w.dims()[w.dims().len() - 1];
-                    x.reshape((bsize * seq_len, dim1, dim2))?
+                    input
+                        .reshape((bsize * seq_len, dim1, dim2))?
                         .matmul(&w)?
                         .reshape((bsize, seq_len, dim1, wdim))?
                 }
             }
             [bsize, seq_len, dim] => {
                 if seq_len > 1 {
-                    x.matmul(&w)?
+                    input.matmul(&w)?
                 } else {
                     let wdim = w.dims()[w.dims().len() - 1];
-                    x.reshape((bsize * seq_len, dim))?
+                    input
+                        .reshape((bsize * seq_len, dim))?
                         .matmul(&w)?
                         .reshape((bsize, seq_len, wdim))?
                 }
             }
-            _ => x.matmul(&w)?,
+            _ => input.matmul(&w)?,
         };
 
+        if let Some(module_name) = self.module_name.as_deref() {
+            let delta = crate::openai::lora::compute_active_lora_delta(
+                module_name,
+                input,
+                out.dtype(),
+                None,
+            )?;
+            if std::env::var_os("CANDLE_VLLM_LORA_DEBUG").is_some()
+                && (module_name.ends_with("layers.0.mlp.down_proj")
+                    || module_name.ends_with("model.layers.0.mlp.down_proj"))
+            {
+                tracing::info!(
+                    target: "lora_debug",
+                    module = module_name,
+                    active_adapter = ?crate::openai::lora::active_adapter_id(),
+                    delta_applied = delta.is_some(),
+                    "Linear::forward LoRA probe"
+                );
+            }
+            if let Some(delta) = delta {
+                out = out.broadcast_add(&delta)?;
+            }
+        }
+
         match &self.bias {
-            None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
+            None => Ok(out),
+            Some(bias) => out.broadcast_add(bias),
         }
     }
 }
@@ -179,13 +224,21 @@ pub fn linear_no_bias(
     shard: Shard,
 ) -> Result<Linear> {
     let weight = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
-    Ok(Linear::new(weight, None))
+    Ok(Linear::new_with_module_name(
+        weight,
+        None,
+        Some(vb.prefix().to_string()),
+    ))
 }
 
 pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder, shard: Shard) -> Result<Linear> {
     let ws = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
     let bs = vb.get((out_dim,), "bias")?;
-    Ok(Linear::new(ws, Some(bs)))
+    Ok(Linear::new_with_module_name(
+        ws,
+        Some(bs),
+        Some(vb.prefix().to_string()),
+    ))
 }
 
 pub fn linear_b(
@@ -284,6 +337,7 @@ pub fn qlinear(
                 Ok(Linear {
                     weight: ws,
                     bias: bs,
+                    module_name: Some(vb.prefix().to_string()),
                     scales: Some(scales),
                     qzeros: None,
                     g_idx: None,
@@ -332,6 +386,7 @@ pub fn qlinear(
                     Ok(Linear {
                         weight: ws,
                         bias: bs,
+                        module_name: Some(vb.prefix().to_string()),
                         scales: Some(scales),
                         qzeros: Some(qzeros),
                         g_idx,
@@ -401,6 +456,7 @@ pub fn qlinear(
                     Ok(Linear {
                         weight: ws,
                         bias: bs,
+                        module_name: Some(vb.prefix().to_string()),
                         scales: Some(scales),
                         qzeros: Some(qzeros),
                         g_idx,
@@ -1368,7 +1424,11 @@ pub fn linear_no_bias_x(
                     } else {
                         vb.get_with_hints((out_dim, in_dim), "weight", shards)?
                     };
-                    return Ok(LinearX::Linear(Linear::new(ws, None)));
+                    return Ok(LinearX::Linear(Linear::new_with_module_name(
+                        ws,
+                        None,
+                        Some(vb.prefix().to_string()),
+                    )));
                 }
             }
             let ln = load_ln_fp8_with_hints(in_dim, out_dim, vb, shards, cfg, false)?;
@@ -1448,7 +1508,7 @@ pub fn linear_no_bias_x(
             vb.get_with_hints((out_dim, in_dim), "weight", shards)?
         };
 
-        let ln = Linear::new(ws, None);
+        let ln = Linear::new_with_module_name(ws, None, Some(vb.prefix().to_string()));
         if quant_local.is_some() {
             let quantized_type = quant_local.as_ref().unwrap().clone();
             Ok(LinearX::QLinear(QLinear::from_linear_x(
