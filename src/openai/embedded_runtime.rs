@@ -44,6 +44,7 @@ pub struct EmbeddedRuntimeConfig {
     pub block_size: usize,
     pub max_num_seqs: usize,
     pub kvcache_mem_gpu: usize,
+    pub gpu_memory_fraction: Option<f32>,
     pub kvcache_mem_cpu: usize,
     pub holding_time: usize,
     pub record_conversation: bool,
@@ -73,6 +74,7 @@ impl Default for EmbeddedRuntimeConfig {
             block_size: 64,
             max_num_seqs: 16,
             kvcache_mem_gpu: 4096,
+            gpu_memory_fraction: Some(0.7),
             kvcache_mem_cpu: 128,
             holding_time: 500,
             record_conversation: false,
@@ -414,20 +416,42 @@ impl EmbeddedCandleVllmHost {
             }
         };
 
+        let first_pipeline = default_pipelines
+            .first()
+            .expect("at least one pipeline must be loaded");
+        let first_config = first_pipeline.get_model_config();
+        let first_model_dtype = first_pipeline.dtype;
+        let devices: Vec<_> = default_pipelines
+            .iter()
+            .map(|pipeline| pipeline.device())
+            .collect();
+        let (kvcache_mem_gpu, mamba_cache_budget_bytes) =
+            crate::resolve_kvcache_budget_for_devices(
+                &devices,
+                config.gpu_memory_fraction,
+                config.kvcache_mem_gpu,
+                &first_config,
+                first_model_dtype,
+                num_shards,
+                config.max_num_seqs.max(16),
+                config.prefix_cache,
+            )?;
+
         let mut runtime_model_config = None;
         let mut cache_config = None;
         let pipelines = default_pipelines
             .into_iter()
             .map(|pipeline| {
                 let cfg = pipeline.get_model_config();
-                let local_cache_cfg = crate::get_cache_config(
-                    config.kvcache_mem_gpu,
+                let mut local_cache_cfg = crate::get_cache_config(
+                    kvcache_mem_gpu,
                     config.kvcache_mem_cpu,
                     config.block_size,
                     &cfg,
                     kv_cache_dtype,
                     num_shards,
                 );
+                local_cache_cfg.mamba_cache_budget_bytes = mamba_cache_budget_bytes;
                 let cache_engine = CacheEngine::new(
                     &cfg,
                     &local_cache_cfg,
