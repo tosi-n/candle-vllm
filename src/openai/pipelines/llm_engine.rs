@@ -36,19 +36,21 @@ use crate::{
     },
     scheduler::{
         cache_engine::{CacheConfig, CacheEngine},
-        sequence::{Sequence, SequenceGroup, _Sequence},
+        sequence::{InteractiveSessionControl, Sequence, SequenceGroup, _Sequence},
         SchedulerConfig, SchedulerOutput,
     },
     InputMetadata,
 };
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use either::Either;
 use flume::Sender;
+use half::{bf16, f16};
 use parking_lot::RwLock;
 #[cfg(feature = "nccl")]
 use rayon::iter::IntoParallelRefIterator;
 #[cfg(feature = "nccl")]
 use rayon::iter::ParallelIterator;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -79,6 +81,35 @@ pub struct BatchExecution {
     model_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvLayerPayload {
+    pub key_shape: Vec<usize>,
+    pub value_shape: Vec<usize>,
+    pub key_bytes: Vec<u8>,
+    pub value_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvSessionPayload {
+    pub session_id: String,
+    pub seq_id: usize,
+    pub prompt_ids: Vec<u32>,
+    pub prompt_len: usize,
+    pub total_len: usize,
+    pub adapter_id: Option<String>,
+    pub block_ids: Vec<usize>,
+    pub layers: Vec<KvLayerPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractiveSessionSnapshot {
+    pub session_id: String,
+    pub prompt_ids: Vec<u32>,
+    pub adapter_id: Option<String>,
+    pub sampling_params: SamplingParams,
+    pub kv_payload: KvSessionPayload,
+}
+
 const _PAD_SLOT_ID: i64 = -1;
 const PREFILL_CHUNK_SIZE: usize = 8192;
 
@@ -94,6 +125,7 @@ pub struct LLMEngine {
     pub sync_notifies: HashMap<String, Option<Arc<Notify>>>,
     pub senders: HashMap<String, Option<Arc<Sender<ChatResponse>>>>,
     pub completion_records: HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>,
+    interactive_sessions: HashMap<String, Arc<InteractiveSessionControl>>,
     sequence_groups: RwLock<VecDeque<Arc<SequenceGroup>>>,
     multi_process: bool,
     num_shards: usize,
@@ -756,6 +788,7 @@ impl LLMEngine {
             group_id: 0,
             notify: notify.clone(),
             completion_records: HashMap::new(),
+            interactive_sessions: HashMap::new(),
             sequence_groups: RwLock::new(VecDeque::new()),
             multi_process,
             num_shards,
@@ -951,6 +984,9 @@ impl LLMEngine {
                 task.tools.clone(),
                 sender,
                 task.include_usage,
+                task.adapter_id.clone(),
+                task.adapter_schedule.clone(),
+                None,
             );
             if task.prefilled_reasoning_end.is_some() {
                 seq_group.active_reasoning_end = task.prefilled_reasoning_end.clone();
@@ -1967,6 +2003,9 @@ impl LLMEngine {
         tools: Vec<crate::tools::Tool>,
         sender: Option<Sender<ChatResponse>>,
         include_usage: bool,
+        adapter_id: Option<String>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
+        interactive_control: Option<Arc<InteractiveSessionControl>>,
     ) -> SequenceGroup {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
             prompt,
@@ -1988,6 +2027,9 @@ impl LLMEngine {
             tools,
             sender,
             include_usage,
+            adapter_id,
+            adapter_schedule,
+            interactive_control,
         )
     }
 
@@ -2007,6 +2049,8 @@ impl LLMEngine {
         sync_notify: Option<Arc<Notify>>,
         include_usage: bool,
         prefilled_reasoning_end: Option<String>,
+        adapter_id: Option<String>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
     ) {
         let prompt_len = prompt.len();
         let sync_notify = sync_notify.clone();
@@ -2046,6 +2090,8 @@ impl LLMEngine {
             images,
             include_usage,
             prefilled_reasoning_end,
+            adapter_id,
+            adapter_schedule,
         };
         let mut waiting_tasks = self.waiting_tasks.write();
         waiting_tasks.push(task);
@@ -2053,7 +2099,327 @@ impl LLMEngine {
         self.group_id += 1;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_interactive_request(
+        &mut self,
+        prompt: Vec<u32>,
+        request_id: String,
+        created: SystemTime,
+        sampling_params: SamplingParams,
+        use_logprobs: bool,
+        is_embedding: bool,
+        encoding_format: crate::openai::requests::EncodingFormat,
+        embedding_type: crate::openai::requests::EmbeddingType,
+        adapter_id: Option<String>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
+        interactive_control: Arc<InteractiveSessionControl>,
+    ) {
+        let seq_group = self.create_sequence_group(
+            self.seq_id,
+            self.group_id,
+            &prompt,
+            None,
+            &request_id,
+            created,
+            &sampling_params,
+            use_logprobs,
+            is_embedding,
+            encoding_format,
+            embedding_type,
+            Vec::new(),
+            None,
+            false,
+            adapter_id,
+            adapter_schedule,
+            Some(interactive_control.clone()),
+        );
+        self.scheduler.add_sequence(seq_group);
+        self.interactive_sessions
+            .insert(request_id, interactive_control);
+        self.seq_id += 1;
+        self.group_id += 1;
+    }
+
+    pub fn interactive_control(&self, request_id: &str) -> Option<Arc<InteractiveSessionControl>> {
+        self.interactive_sessions.get(request_id).cloned()
+    }
+
+    pub fn grant_decode_steps(&mut self, request_id: &str, steps: usize) -> bool {
+        if let Some(control) = self.interactive_sessions.get(request_id) {
+            control.grant_decode_steps(steps);
+            return true;
+        }
+        false
+    }
+
     pub fn get_available_kv_tokens(&self) -> usize {
         self.scheduler.get_available_kv_tokens()
     }
+
+    pub fn get_session_lookup(&self, request_id: &str) -> Option<crate::scheduler::SessionLookup> {
+        self.scheduler.lookup_session(request_id)
+    }
+
+    pub fn export_session_payload(&self, request_id: &str) -> Result<Option<KvSessionPayload>> {
+        let Some(lookup) = self.scheduler.lookup_session(request_id) else {
+            return Ok(None);
+        };
+        let (_, cache_engine) = self
+            .get_pipeline(0)
+            .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
+        let kv_cache = cache_engine.get_kv_cache();
+
+        let mut layers = Vec::new();
+        if !lookup.block_ids.is_empty() {
+            for (key_cache, value_cache) in kv_cache.iter() {
+                let key_selected = gather_blocks(key_cache, &lookup.block_ids)?;
+                let value_selected = gather_blocks(value_cache, &lookup.block_ids)?;
+                let key_shape = key_selected.dims().to_vec();
+                let value_shape = value_selected.dims().to_vec();
+                let key_bytes = tensor_to_bytes(&key_selected)?;
+                let value_bytes = tensor_to_bytes(&value_selected)?;
+                layers.push(KvLayerPayload {
+                    key_shape,
+                    value_shape,
+                    key_bytes,
+                    value_bytes,
+                });
+            }
+        }
+
+        Ok(Some(KvSessionPayload {
+            session_id: lookup.request_id,
+            seq_id: lookup.seq_id,
+            prompt_ids: lookup.prompt_ids,
+            prompt_len: lookup.prompt_len,
+            total_len: lookup.total_len,
+            adapter_id: lookup.adapter_id,
+            block_ids: lookup.block_ids,
+            layers,
+        }))
+    }
+
+    pub fn export_interactive_session_snapshot(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<InteractiveSessionSnapshot>> {
+        let Some(lookup) = self.scheduler.lookup_session(request_id) else {
+            return Ok(None);
+        };
+        let Some(kv_payload) = self.export_session_payload(request_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(InteractiveSessionSnapshot {
+            session_id: lookup.request_id,
+            prompt_ids: lookup.prompt_ids,
+            adapter_id: lookup.adapter_id,
+            sampling_params: lookup.sampling_params,
+            kv_payload,
+        }))
+    }
+
+    pub fn import_session_payload(&mut self, payload: KvSessionPayload) -> Result<()> {
+        let Some(lookup) = self.scheduler.lookup_session(&payload.session_id) else {
+            candle_core::bail!(
+                "Cannot import KV: target session '{}' was not found.",
+                payload.session_id
+            );
+        };
+
+        if lookup.block_ids.len() != payload.block_ids.len() {
+            candle_core::bail!(
+                "KV block count mismatch for session '{}': target={} imported={}",
+                payload.session_id,
+                lookup.block_ids.len(),
+                payload.block_ids.len()
+            );
+        }
+
+        let (_, cache_engine) = self
+            .get_mut_pipeline(0)
+            .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
+        let mut kv_cache = cache_engine.get_kv_cache();
+
+        if payload.layers.len() != kv_cache.len() {
+            candle_core::bail!(
+                "KV layer count mismatch for session '{}': target={} imported={}",
+                payload.session_id,
+                kv_cache.len(),
+                payload.layers.len()
+            );
+        }
+
+        let block_mapping: HashMap<usize, usize> = lookup
+            .block_ids
+            .iter()
+            .enumerate()
+            .map(|(src_idx, dst_block)| (src_idx, *dst_block))
+            .collect();
+
+        for (layer_idx, layer_payload) in payload.layers.iter().enumerate() {
+            let (dst_key_cache, dst_value_cache) = kv_cache
+                .get_mut(layer_idx)
+                .ok_or_else(|| candle_core::Error::msg("Invalid cache layer index"))?;
+
+            validate_import_shape("key", layer_idx, &layer_payload.key_shape, dst_key_cache)?;
+            validate_import_shape(
+                "value",
+                layer_idx,
+                &layer_payload.value_shape,
+                dst_value_cache,
+            )?;
+
+            let key_src = bytes_to_tensor(
+                &layer_payload.key_bytes,
+                &layer_payload.key_shape,
+                dst_key_cache.dtype(),
+            )?;
+            let value_src = bytes_to_tensor(
+                &layer_payload.value_bytes,
+                &layer_payload.value_shape,
+                dst_value_cache.dtype(),
+            )?;
+
+            swap_blocks_into(key_src, dst_key_cache, block_mapping.clone())?;
+            swap_blocks_into(value_src, dst_value_cache, block_mapping.clone())?;
+        }
+
+        Ok(())
+    }
+
+    pub fn release_session(&mut self, request_id: &str) -> bool {
+        self.interactive_sessions.remove(request_id);
+        self.scheduler.abort_session_by_request_id(request_id)
+    }
+}
+
+fn gather_blocks(cache: &Tensor, block_ids: &[usize]) -> Result<Tensor> {
+    if block_ids.is_empty() {
+        candle_core::bail!("No block ids available to gather KV cache");
+    }
+    if block_ids.len() == 1 {
+        return cache.narrow(0, block_ids[0], 1);
+    }
+    let mut parts = Vec::with_capacity(block_ids.len());
+    for block_id in block_ids {
+        parts.push(cache.narrow(0, *block_id, 1)?);
+    }
+    Tensor::cat(&parts, 0)
+}
+
+fn tensor_to_bytes(tensor: &Tensor) -> Result<Vec<u8>> {
+    let cpu = tensor.to_device(&Device::Cpu)?;
+    let flat = cpu.flatten_all()?;
+    let bytes = match flat.dtype() {
+        DType::F32 => flat
+            .to_vec1::<f32>()?
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect(),
+        DType::F16 => flat
+            .to_vec1::<f16>()?
+            .into_iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect(),
+        DType::BF16 => flat
+            .to_vec1::<bf16>()?
+            .into_iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect(),
+        DType::U8 => flat.to_vec1::<u8>()?,
+        dtype => {
+            candle_core::bail!("Unsupported KV dtype for export: {dtype:?}");
+        }
+    };
+    Ok(bytes)
+}
+
+fn bytes_to_tensor(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Tensor> {
+    match dtype {
+        DType::F32 => {
+            if bytes.len() % 4 != 0 {
+                candle_core::bail!("Invalid f32 byte length {}", bytes.len());
+            }
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape.to_vec(), &Device::Cpu)
+        }
+        DType::F16 => {
+            if bytes.len() % 2 != 0 {
+                candle_core::bail!("Invalid f16 byte length {}", bytes.len());
+            }
+            let values = bytes
+                .chunks_exact(2)
+                .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape.to_vec(), &Device::Cpu)
+        }
+        DType::BF16 => {
+            if bytes.len() % 2 != 0 {
+                candle_core::bail!("Invalid bf16 byte length {}", bytes.len());
+            }
+            let values = bytes
+                .chunks_exact(2)
+                .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape.to_vec(), &Device::Cpu)
+        }
+        DType::U8 => Tensor::from_vec(bytes.to_vec(), shape.to_vec(), &Device::Cpu),
+        other => candle_core::bail!("Unsupported KV dtype for import: {other:?}"),
+    }
+}
+
+fn validate_import_shape(
+    kind: &str,
+    layer_idx: usize,
+    import_shape: &[usize],
+    dst_cache: &Tensor,
+) -> Result<()> {
+    let dst_dims = dst_cache.dims();
+    if import_shape.len() != dst_dims.len() {
+        candle_core::bail!(
+            "Invalid {kind} shape rank at layer {}: imported={:?} expected={:?}",
+            layer_idx,
+            import_shape,
+            dst_dims
+        );
+    }
+    if import_shape.is_empty() {
+        candle_core::bail!("Invalid empty {kind} shape at layer {}", layer_idx);
+    }
+    if import_shape[0] == 0 {
+        candle_core::bail!(
+            "Invalid imported {kind} with zero blocks at layer {}",
+            layer_idx
+        );
+    }
+    if import_shape[1..] != dst_dims[1..] {
+        candle_core::bail!(
+            "Incompatible {kind} shape at layer {}: imported={:?} target={:?}",
+            layer_idx,
+            import_shape,
+            dst_dims
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn swap_blocks_into(
+    src: Tensor,
+    dst: &mut Tensor,
+    block_mapping: HashMap<usize, usize>,
+) -> Result<()> {
+    crate::backend::swap_blocks(src, &*dst, block_mapping)
+}
+
+#[cfg(not(feature = "metal"))]
+fn swap_blocks_into(
+    src: Tensor,
+    dst: &mut Tensor,
+    block_mapping: HashMap<usize, usize>,
+) -> Result<()> {
+    crate::backend::swap_blocks(src, dst, block_mapping)
 }

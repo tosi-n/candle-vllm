@@ -8,6 +8,7 @@ use super::responses::{APIError, ChatCompletionResponse, ChatResponder};
 use super::sampling_params::{EarlyStoppingCondition, SamplingParams};
 use super::streaming::{ChatResponse, Streamer, StreamingStatus};
 use super::OpenAIServerData;
+use crate::openai::lora::{LoadAdapterRequest, RegisterAdapterRequest, UnloadAdapterRequest};
 use crate::openai::multimodal::{build_messages_and_images, ImageData};
 use crate::openai::{resolve_tools_for_request, ResolvedToolConfig};
 use crate::tools::stream_parser::{
@@ -16,10 +17,12 @@ use crate::tools::stream_parser::{
 use crate::tools::ToolFormat;
 use axum::response::sse::KeepAlive;
 use axum::{
-    extract::{Json, State},
-    response::Sse,
+    extract::{Json, Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response, Sse},
 };
 use flume;
+use serde_json::json;
 use std::env;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -187,6 +190,84 @@ async fn check_length(
     }
 }
 
+fn parse_adapter_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {
+    if let Some(adapter_id) = headers
+        .get("x-runtime-adapter-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(adapter_id.to_string());
+    }
+
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.runtime.as_ref())
+        .and_then(|runtime| runtime.adapter_id.clone())
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn parse_adapter_schedule(
+    request: &ChatCompletionRequest,
+) -> Option<Vec<crate::openai::requests::AdapterScheduleStep>> {
+    let mut schedule = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.runtime.as_ref())
+        .and_then(|runtime| runtime.adapter_schedule.clone())?;
+
+    schedule.retain(|step| !step.adapter_id.trim().is_empty());
+    if schedule.is_empty() {
+        return None;
+    }
+
+    schedule.sort_by_key(|step| step.start_step);
+    for step in &mut schedule {
+        step.adapter_id = step.adapter_id.trim().to_string();
+    }
+    Some(schedule)
+}
+
+fn parse_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-runtime-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WarmupAdaptersRequest {
+    pub adapter_ids: Vec<String>,
+    #[serde(default)]
+    pub wait: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WarmupAdaptersResponse {
+    pub requested: usize,
+    pub queued: usize,
+    pub loaded: usize,
+    pub failed: Vec<String>,
+}
+
+fn ensure_local_adapter_scope(raw: Option<&str>) -> Result<(), APIError> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let scope = raw.trim().to_lowercase();
+    if scope.is_empty() || scope == "local" {
+        return Ok(());
+    }
+    Err(APIError::new(format!(
+        "Invalid adapter scope '{}'. This runtime only supports local adapter operations.",
+        raw
+    )))
+}
+
 #[utoipa::path(
     post,
     tag = "candle-vllm",
@@ -196,6 +277,7 @@ async fn check_length(
 )]
 pub async fn chat_completions(
     State(data): State<Arc<OpenAIServerData>>,
+    headers: HeaderMap,
     request: Json<ChatCompletionRequest>,
 ) -> ChatResponder {
     let mut request = request.0;
@@ -225,6 +307,28 @@ pub async fn chat_completions(
         return ChatResponder::ValidationError(APIError::new_str(
             "`logit_bias` is not currently supported.",
         ));
+    }
+
+    let session_id = parse_session_id(&headers);
+    let mut adapter_id = parse_adapter_id(&headers, &request);
+    let adapter_schedule = parse_adapter_schedule(&request);
+    if adapter_id.is_none() {
+        if let Some(session_id) = session_id.as_ref() {
+            adapter_id = data.session_adapters.read().get(session_id).cloned();
+        }
+    }
+    if let (Some(session_id), Some(adapter_id)) = (session_id.as_ref(), adapter_id.as_ref()) {
+        data.session_adapters
+            .write()
+            .insert(session_id.clone(), adapter_id.clone());
+    }
+    if let Some(adapter) = adapter_id.as_deref() {
+        if let Err(err) = data.lora_manager.ensure_loaded_async(adapter).await {
+            return ChatResponder::ValidationError(APIError::new(format!(
+                "Failed to prepare adapter '{}': {}",
+                adapter, err
+            )));
+        }
     }
 
     let tool_config = match resolve_tools_for_request(
@@ -335,6 +439,8 @@ pub async fn chat_completions(
     } else {
         Some(Arc::clone(&sync_notify))
     };
+    let adapter_id_for_engine = adapter_id.clone();
+    let adapter_schedule_for_engine = adapter_schedule.clone();
 
     let _ = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(async move {
@@ -359,6 +465,8 @@ pub async fn chat_completions(
                     sync_completion_notify,
                     include_usage,
                     prefilled_reasoning_end,
+                    adapter_id_for_engine,
+                    adapter_schedule_for_engine,
                 );
                 model.notify.notify_one();
             }
@@ -558,6 +666,8 @@ pub async fn create_embeddings(
                     None,
                     false,
                     None,
+                    None,
+                    None,
                 );
                 model.notify.notify_one();
             }
@@ -571,5 +681,280 @@ pub async fn create_embeddings(
         Ok(ChatResponse::ModelError(e)) => ChatResponder::ModelError(APIError::new_str(&e)),
         Ok(_) => ChatResponder::InternalError(APIError::new(format!("Unexpected response type"))),
         Err(_) => ChatResponder::InternalError(APIError::new("Channel closed".to_string())),
+    }
+}
+
+#[utoipa::path(
+    post,
+    tag = "candle-vllm",
+    path = "/v1/adapters",
+    request_body = RegisterAdapterRequest,
+    responses((status = 200, description = "Registered adapter"))
+)]
+pub async fn register_adapter(
+    State(data): State<Arc<OpenAIServerData>>,
+    request: Json<RegisterAdapterRequest>,
+) -> Response {
+    let mut request = request.0;
+    if let Err(err) = ensure_local_adapter_scope(request.scope.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+    request.scope = None;
+    request.backend = None;
+    match data.lora_manager.register(request) {
+        Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+        Err(err) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(
+    get,
+    tag = "candle-vllm",
+    path = "/v1/adapters",
+    responses((status = 200, description = "List adapters"))
+)]
+pub async fn list_adapters(State(data): State<Arc<OpenAIServerData>>) -> Response {
+    (StatusCode::OK, Json(data.lora_manager.list())).into_response()
+}
+
+#[utoipa::path(
+    get,
+    tag = "candle-vllm",
+    path = "/v1/adapters/{id}",
+    params(("id" = String, Path, description = "Adapter id")),
+    responses((status = 200, description = "Get adapter"))
+)]
+pub async fn get_adapter(
+    State(data): State<Arc<OpenAIServerData>>,
+    Path(id): Path<String>,
+) -> Response {
+    match data.lora_manager.get(&id) {
+        Some(record) => (StatusCode::OK, Json(record)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Adapter '{}' not found", id) })),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    tag = "candle-vllm",
+    path = "/v1/adapters/{id}/load",
+    request_body = LoadAdapterRequest,
+    params(("id" = String, Path, description = "Adapter id")),
+    responses((status = 200, description = "Load adapter"))
+)]
+pub async fn load_adapter(
+    State(data): State<Arc<OpenAIServerData>>,
+    Path(id): Path<String>,
+    request: Option<Json<LoadAdapterRequest>>,
+) -> Response {
+    let request = request.map(|json| json.0).unwrap_or_default();
+    if let Err(err) = ensure_local_adapter_scope(request.scope.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let pin_override = request.pinned;
+    let wait = request.wait.unwrap_or(false);
+
+    if wait {
+        return match data.lora_manager.load_async(&id, pin_override).await {
+            Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+            Err(err) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response(),
+        };
+    }
+
+    let (record, should_start) = match data.lora_manager.enqueue_load(&id, pin_override) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    if should_start {
+        let manager = Arc::clone(&data.lora_manager);
+        let id_for_task = id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = manager.load_async(&id_for_task, None).await {
+                tracing::warn!(
+                    "Background LoRA load failed for adapter '{}': {}",
+                    id_for_task,
+                    err
+                );
+            }
+        });
+    }
+
+    (StatusCode::ACCEPTED, Json(record)).into_response()
+}
+
+#[utoipa::path(
+    post,
+    tag = "candle-vllm",
+    path = "/v1/adapters/{id}/unload",
+    params(("id" = String, Path, description = "Adapter id")),
+    responses((status = 200, description = "Unload adapter"))
+)]
+pub async fn unload_adapter(
+    State(data): State<Arc<OpenAIServerData>>,
+    Path(id): Path<String>,
+    request: Option<Json<UnloadAdapterRequest>>,
+) -> Response {
+    let request = request.map(|json| json.0).unwrap_or_default();
+    if let Err(err) = ensure_local_adapter_scope(request.scope.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    match data.lora_manager.unload(&id) {
+        Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+        Err(err) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(
+    get,
+    tag = "candle-vllm",
+    path = "/v1/adapters/status",
+    responses((status = 200, description = "Adapter status"))
+)]
+pub async fn adapters_status(State(data): State<Arc<OpenAIServerData>>) -> Response {
+    (StatusCode::OK, Json(data.lora_manager.status())).into_response()
+}
+
+#[utoipa::path(
+    post,
+    tag = "candle-vllm",
+    path = "/v1/adapters/warmup",
+    request_body = WarmupAdaptersRequest,
+    responses((status = 200, description = "Warmup adapters"))
+)]
+pub async fn warmup_adapters(
+    State(data): State<Arc<OpenAIServerData>>,
+    request: Json<WarmupAdaptersRequest>,
+) -> Response {
+    let mut queued = 0usize;
+    let mut loaded = 0usize;
+    let mut failed = Vec::new();
+
+    for raw_id in &request.adapter_ids {
+        let adapter_id = raw_id.trim();
+        if adapter_id.is_empty() {
+            continue;
+        }
+
+        if request.wait {
+            match data.lora_manager.load_async(adapter_id, None).await {
+                Ok(_) => loaded += 1,
+                Err(err) => failed.push(format!("local/{adapter_id}: {err}")),
+            }
+        } else {
+            match data.lora_manager.enqueue_load(adapter_id, None) {
+                Ok((_, should_start)) => {
+                    queued += 1;
+                    if should_start {
+                        let manager = Arc::clone(&data.lora_manager);
+                        let id = adapter_id.to_string();
+                        tokio::spawn(async move {
+                            if let Err(err) = manager.load_async(&id, None).await {
+                                tracing::warn!("Warmup load failed for adapter '{}': {}", id, err);
+                            }
+                        });
+                    }
+                }
+                Err(err) => failed.push(format!("local/{adapter_id}: {err}")),
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(WarmupAdaptersResponse {
+            requested: request.adapter_ids.len(),
+            queued,
+            loaded,
+            failed,
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_scope_accepts_local_or_empty() {
+        assert!(ensure_local_adapter_scope(None).is_ok());
+        assert!(ensure_local_adapter_scope(Some("local")).is_ok());
+        assert!(ensure_local_adapter_scope(Some("")).is_ok());
+    }
+
+    #[test]
+    fn adapter_scope_rejects_non_local_values() {
+        let err = ensure_local_adapter_scope(Some("cloud")).expect_err("cloud scope should fail");
+        assert!(err.to_string().contains("only supports local"));
+    }
+
+    #[test]
+    fn adapter_schedule_is_sorted_and_trimmed() {
+        let request = ChatCompletionRequest {
+            metadata: Some(crate::openai::requests::ChatCompletionMetadata {
+                runtime: Some(crate::openai::requests::RuntimeRequestMetadata {
+                    adapter_id: Some("base".to_string()),
+                    adapter_schedule: Some(vec![
+                        crate::openai::requests::AdapterScheduleStep {
+                            start_step: 10,
+                            adapter_id: "  role_b ".to_string(),
+                        },
+                        crate::openai::requests::AdapterScheduleStep {
+                            start_step: 2,
+                            adapter_id: "role_a".to_string(),
+                        },
+                        crate::openai::requests::AdapterScheduleStep {
+                            start_step: 12,
+                            adapter_id: " ".to_string(),
+                        },
+                    ]),
+                }),
+            }),
+            ..ChatCompletionRequest::default()
+        };
+
+        let schedule = parse_adapter_schedule(&request).expect("schedule should parse");
+        assert_eq!(schedule.len(), 2);
+        assert_eq!(schedule[0].start_step, 2);
+        assert_eq!(schedule[0].adapter_id, "role_a");
+        assert_eq!(schedule[1].start_step, 10);
+        assert_eq!(schedule[1].adapter_id, "role_b");
     }
 }

@@ -1978,6 +1978,25 @@ impl DefaultPipeline {
         }
     }
 
+    pub fn forward_internalize_states(
+        &self,
+        input_tokens: Tensor,
+        input_positions: &Tensor,
+        input_metadata: &InputMetadata,
+        max_hidden_states: usize,
+    ) -> Result<Vec<Tensor>> {
+        let _fp8_linear_prefill_guard = set_linear_is_prefill(input_metadata.is_prefill);
+        match &self.model {
+            LLMModel::Qwen(qwen) => qwen.forward_internalize_states(
+                &input_tokens,
+                input_positions,
+                input_metadata,
+                max_hidden_states,
+            ),
+            _ => candle_core::bail!("Model not supported for adapter internalization"),
+        }
+    }
+
     pub fn sample(
         &mut self,
         logits: &Tensor,

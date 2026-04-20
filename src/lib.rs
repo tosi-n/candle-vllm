@@ -2,6 +2,7 @@
 use candle::utils::{cuda_is_available, metal_is_available};
 use candle::{Device, Result};
 use candle_core as candle;
+pub use candle_core;
 use std::path::Path;
 use tracing::warn;
 pub mod backend;

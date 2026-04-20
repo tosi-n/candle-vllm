@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
@@ -10,7 +10,9 @@ use crate::openai::streaming::ChatResponse;
 use crate::tools::stream_parser::StreamToolParser;
 use crate::tools::{Tool, ToolCall};
 use flume::Sender;
+use parking_lot::Mutex;
 use std::time::SystemTime;
+use tokio::sync::Notify;
 #[derive(Clone, PartialEq)]
 pub enum SequenceStatus {
     FinishedIgnored,
@@ -27,6 +29,115 @@ pub enum ToolCallState {
     Normal,
     MaybeToolCall,
     InToolCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractiveSessionEvent {
+    PrefillReady,
+    Token(u32),
+    Finished,
+    Error(String),
+}
+
+#[derive(Debug, Default)]
+struct InteractiveSessionState {
+    decode_budget: usize,
+    import_only: bool,
+    events: VecDeque<InteractiveSessionEvent>,
+}
+
+#[derive(Debug)]
+pub struct InteractiveSessionControl {
+    state: Mutex<InteractiveSessionState>,
+    notify: Notify,
+}
+
+impl InteractiveSessionControl {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(InteractiveSessionState::default()),
+            notify: Notify::new(),
+        })
+    }
+
+    pub fn new_import_only() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(InteractiveSessionState {
+                import_only: true,
+                ..InteractiveSessionState::default()
+            }),
+            notify: Notify::new(),
+        })
+    }
+
+    pub fn decode_budget(&self) -> usize {
+        self.state.lock().decode_budget
+    }
+
+    pub fn grant_decode_steps(&self, steps: usize) {
+        if steps == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.decode_budget = state.decode_budget.saturating_add(steps);
+        self.notify.notify_waiters();
+    }
+
+    pub fn consume_decode_step(&self) {
+        let mut state = self.state.lock();
+        if state.decode_budget > 0 {
+            state.decode_budget -= 1;
+        }
+    }
+
+    pub fn is_import_only(&self) -> bool {
+        self.state.lock().import_only
+    }
+
+    pub fn clear_import_only(&self) {
+        self.state.lock().import_only = false;
+    }
+
+    pub fn publish_prefill_ready(&self) {
+        self.state
+            .lock()
+            .events
+            .push_back(InteractiveSessionEvent::PrefillReady);
+        self.notify.notify_waiters();
+    }
+
+    pub fn publish_token(&self, token: u32) {
+        self.state
+            .lock()
+            .events
+            .push_back(InteractiveSessionEvent::Token(token));
+        self.notify.notify_waiters();
+    }
+
+    pub fn publish_finished(&self) {
+        self.state
+            .lock()
+            .events
+            .push_back(InteractiveSessionEvent::Finished);
+        self.notify.notify_waiters();
+    }
+
+    pub fn publish_error(&self, message: impl Into<String>) {
+        self.state
+            .lock()
+            .events
+            .push_back(InteractiveSessionEvent::Error(message.into()));
+        self.notify.notify_waiters();
+    }
+
+    pub async fn next_event(&self) -> InteractiveSessionEvent {
+        loop {
+            if let Some(event) = self.state.lock().events.pop_front() {
+                return event;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 pub struct SequenceData {
@@ -151,6 +262,10 @@ impl _Sequence {
         dref.prompt_token_ids.len() + dref.output_token_ids.len()
     }
 
+    pub fn get_output_len(&self) -> usize {
+        self.deref().output_token_ids.len()
+    }
+
     pub fn get_token_ids(&self) -> Vec<u32> {
         let mut res = self.deref().prompt_token_ids.clone();
         res.extend(
@@ -245,6 +360,10 @@ impl _Sequence {
         self.deref_mut().num_cached_tokens = num_cached_tokens;
     }
 
+    pub fn needs_prefill(&self) -> bool {
+        self.deref().num_cached_tokens < self.deref().prompt_token_ids.len()
+    }
+
     pub fn get_images(&self) -> Option<ImageData> {
         self.deref().images.clone()
     }
@@ -317,6 +436,9 @@ pub struct SequenceGroup {
     pub tools: Vec<Tool>,
     pub sender: Option<Sender<ChatResponse>>,
     pub include_usage: bool,
+    pub adapter_id: Option<String>,
+    pub adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
+    pub interactive_control: Option<Arc<InteractiveSessionControl>>,
     // Tool call and reasoning tracking
     pub accumulated_output: String,
     pub tool_call_state: ToolCallState,
@@ -345,6 +467,9 @@ impl SequenceGroup {
         tools: Vec<Tool>,
         sender: Option<Sender<ChatResponse>>,
         include_usage: bool,
+        adapter_id: Option<String>,
+        adapter_schedule: Option<Vec<crate::openai::requests::AdapterScheduleStep>>,
+        interactive_control: Option<Arc<InteractiveSessionControl>>,
     ) -> Self {
         let mut seq_map = HashMap::new();
         for seq in seqs {
@@ -364,6 +489,9 @@ impl SequenceGroup {
             tools,
             sender,
             include_usage,
+            adapter_id,
+            adapter_schedule,
+            interactive_control,
             accumulated_output: "".to_string(),
             tool_call_state: ToolCallState::Normal,
             tool_call_buffer: String::new(),
@@ -442,5 +570,175 @@ impl SequenceGroup {
 
     pub fn get_created_time(&self) -> SystemTime {
         self.created_time
+    }
+
+    pub fn adapter_id(&self) -> Option<&str> {
+        self.adapter_id.as_deref()
+    }
+
+    pub fn interactive_control(&self) -> Option<Arc<InteractiveSessionControl>> {
+        self.interactive_control.clone()
+    }
+
+    pub fn is_decode_blocked(&self) -> bool {
+        let Some(control) = self.interactive_control.as_ref() else {
+            return false;
+        };
+        let Some(seq) = self.seqs.values().next() else {
+            return false;
+        };
+        !seq.deref().needs_prefill() && control.decode_budget() == 0
+    }
+
+    pub fn resolve_decode_adapter_id(&self) -> Option<String> {
+        let Some(timeline) = self.adapter_schedule.as_ref() else {
+            return self.adapter_id.clone();
+        };
+        if timeline.is_empty() {
+            return self.adapter_id.clone();
+        }
+
+        let step = self
+            .seqs
+            .values()
+            .next()
+            .map(|seq| seq.deref().get_output_len())
+            .unwrap_or(0);
+
+        let mut selected = self.adapter_id.clone();
+        for event in timeline {
+            if event.start_step <= step {
+                selected = Some(event.adapter_id.clone());
+            } else {
+                break;
+            }
+        }
+        selected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::sampling_params::{EarlyStoppingCondition, SamplingParams};
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn resolve_decode_adapter_id_switches_at_step_boundaries() {
+        let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
+            &vec![1, 2, 3],
+            42,
+            16,
+            None,
+        ))));
+        let sampling_params = SamplingParams::new(
+            1,
+            None,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1.0,
+            EarlyStoppingCondition::UnlikelyBetterCandidates,
+            None,
+            vec![],
+            false,
+            16,
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("sampling params");
+        let group = SequenceGroup::new(
+            &[seq.clone()],
+            0,
+            1,
+            "req-1".to_string(),
+            SystemTime::now(),
+            sampling_params,
+            false,
+            false,
+            crate::openai::requests::EncodingFormat::Float,
+            crate::openai::requests::EmbeddingType::Last,
+            Vec::new(),
+            None,
+            false,
+            Some("base".to_string()),
+            Some(vec![
+                crate::openai::requests::AdapterScheduleStep {
+                    start_step: 0,
+                    adapter_id: "planner".to_string(),
+                },
+                crate::openai::requests::AdapterScheduleStep {
+                    start_step: 2,
+                    adapter_id: "verifier".to_string(),
+                },
+            ]),
+            None,
+        );
+
+        assert_eq!(
+            group.resolve_decode_adapter_id().as_deref(),
+            Some("planner")
+        );
+
+        seq.deref_mut()
+            .add_token(crate::openai::sampling_params::Logprobs {
+                token: 5,
+                logprob: 0.0,
+                bytes: "a".to_string(),
+                top_logprobs: Vec::new(),
+            });
+        assert_eq!(
+            group.resolve_decode_adapter_id().as_deref(),
+            Some("planner")
+        );
+
+        seq.deref_mut()
+            .add_token(crate::openai::sampling_params::Logprobs {
+                token: 6,
+                logprob: 0.0,
+                bytes: "b".to_string(),
+                top_logprobs: Vec::new(),
+            });
+        assert_eq!(
+            group.resolve_decode_adapter_id().as_deref(),
+            Some("verifier")
+        );
+    }
+
+    #[test]
+    fn interactive_control_queues_events_and_budget() {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let control = InteractiveSessionControl::new_import_only();
+            assert!(control.is_import_only());
+            assert_eq!(control.decode_budget(), 0);
+
+            control.publish_prefill_ready();
+            control.grant_decode_steps(2);
+            control.consume_decode_step();
+            control.publish_token(42);
+            control.publish_finished();
+
+            assert_eq!(control.decode_budget(), 1);
+            assert_eq!(
+                control.next_event().await,
+                InteractiveSessionEvent::PrefillReady
+            );
+            assert_eq!(
+                control.next_event().await,
+                InteractiveSessionEvent::Token(42)
+            );
+            assert_eq!(
+                control.next_event().await,
+                InteractiveSessionEvent::Finished
+            );
+        });
     }
 }

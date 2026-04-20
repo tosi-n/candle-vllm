@@ -7,8 +7,12 @@ use axum::{
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "nccl")]
 use candle_vllm::backend::heartbeat;
+use candle_vllm::openai::lora::{set_global_lora_manager, LoRAManager};
 use candle_vllm::openai::models::Config;
-use candle_vllm::openai::openai_server::{chat_completions, create_embeddings};
+use candle_vllm::openai::openai_server::{
+    adapters_status, chat_completions, create_embeddings, get_adapter, list_adapters, load_adapter,
+    register_adapter, unload_adapter, warmup_adapters,
+};
 use candle_vllm::openai::pipelines::llm_engine::LLMEngine;
 use candle_vllm::openai::pipelines::pipeline::DefaultLoader;
 use candle_vllm::openai::sampling_params::GenerationConfig;
@@ -19,8 +23,10 @@ use candle_vllm::scheduler::SchedulerConfig;
 use clap::Parser;
 use colored::*;
 use local_ip_address::local_ip;
+use parking_lot::RwLock;
 use rustchatui::start_ui_server;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
@@ -609,12 +615,30 @@ async fn main() -> Result<()> {
         None
     };
 
+    let runtime_model_name = {
+        let engine = llm_engine.read();
+        let (pipeline, _) = engine
+            .get_pipeline(0)
+            .expect("at least one pipeline must be loaded");
+        pipeline.name().to_string()
+    };
+    let lora_manager = Arc::new(LoRAManager::new(
+        Some(runtime_model_name.clone()),
+        8,
+        64,
+        "fallback",
+    ));
+    set_global_lora_manager(Arc::clone(&lora_manager));
+
     let server_data = OpenAIServerData {
         pipeline_config,
         model: llm_engine,
         record_conversation: args.record_conversation,
         device: Device::Cpu,
+        runtime_local_only_strict: true,
         mcp_manager: mcp_manager.clone(),
+        lora_manager,
+        session_adapters: Arc::new(RwLock::new(HashMap::new())),
     };
 
     if let Some(manager) = &mcp_manager {
@@ -679,6 +703,12 @@ async fn main() -> Result<()> {
         )
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(create_embeddings))
+        .route("/v1/adapters", post(register_adapter).get(list_adapters))
+        .route("/v1/adapters/status", get(adapters_status))
+        .route("/v1/adapters/warmup", post(warmup_adapters))
+        .route("/v1/adapters/{id}", get(get_adapter))
+        .route("/v1/adapters/{id}/load", post(load_adapter))
+        .route("/v1/adapters/{id}/unload", post(unload_adapter))
         .layer(cors_layer)
         .with_state(Arc::new(server_data));
 
