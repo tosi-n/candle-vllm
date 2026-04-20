@@ -3,10 +3,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use candle_core::{DType, Device, Result as CandleResult};
+use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use flume::Receiver;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::openai::lora::{
@@ -17,7 +18,7 @@ use crate::openai::pipelines::llm_engine::{InteractiveSessionSnapshot, LLMEngine
 use crate::openai::pipelines::pipeline::DefaultLoader;
 use crate::openai::requests::{
     extract_text_from_content, extract_text_from_required_content, ChatCompletionRequest,
-    EmbeddingType, EncodingFormat, Messages,
+    ChatMessage, EmbeddingType, EncodingFormat, MessageContentType, Messages,
 };
 use crate::openai::responses::{APIError, ChatCompletionResponse};
 use crate::openai::runtime_internal::{RuntimeInternalService, RuntimeKvProfile};
@@ -116,6 +117,12 @@ pub struct EmbeddedSessionInfo {
     pub cached_len: usize,
     pub generated_tokens: usize,
     pub adapter_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct AdapterContextCapture {
+    pub prompt_ids: Vec<u32>,
+    pub hidden_states: Vec<Tensor>,
 }
 
 #[derive(Clone)]
@@ -593,6 +600,105 @@ impl EmbeddedCandleVllmHost {
 
     pub fn get_adapter(&self, adapter_id: &str) -> Option<AdapterRecord> {
         self.data.lora_manager.get(adapter_id)
+    }
+
+    pub async fn capture_adapter_context(
+        &self,
+        document_text: &str,
+        max_hidden_states: usize,
+    ) -> CandleResult<AdapterContextCapture> {
+        let trimmed = document_text.trim();
+        if trimmed.is_empty() {
+            candle_core::bail!("document_text must not be empty");
+        }
+
+        let request = ChatCompletionRequest {
+            messages: Messages::Chat(vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(MessageContentType::PureText(String::new())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MessageContentType::PureText(trimmed.to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ]),
+            thinking: Some(false),
+            ..ChatCompletionRequest::default()
+        };
+        let tool_config = resolve_tools_for_request(
+            &request.tools,
+            &request.tool_choice,
+            self.data.mcp_manager.as_ref(),
+        )
+        .map_err(|error| candle_core::Error::msg(error.to_string()))?;
+        let prompt = build_prompt(&self.data, &request, &tool_config)
+            .await
+            .map_err(|error| candle_core::Error::msg(error.to_string()))?;
+        let (prompt_ids, _) = check_length(&request, prompt, &self.data)
+            .await
+            .map_err(|error| candle_core::Error::msg(error.to_string()))?;
+        info!(
+            prompt_tokens = prompt_ids.len(),
+            max_hidden_states,
+            "embedded runtime prepared prompt ids for adapter capture"
+        );
+
+        let hidden_states = {
+            let model = self.data.model.read();
+            let pipeline = model
+                .get_pipeline(0)
+                .ok_or_else(|| candle_core::Error::msg("Missing pipeline"))?;
+            let device = pipeline.0.device();
+            let prompt_len = prompt_ids.len();
+            let tokens = Tensor::from_vec(prompt_ids.clone(), (prompt_len,), device)?;
+            let positions = Tensor::from_vec(
+                (0..prompt_len as i64).collect::<Vec<_>>(),
+                (prompt_len,),
+                device,
+            )?;
+            let slot_mapping =
+                Tensor::from_vec((0..prompt_len as i64).collect::<Vec<_>>(), (prompt_len,), device)?;
+            let cu_seqlens =
+                Tensor::from_vec(vec![0u32, prompt_len as u32], (2,), device)?;
+            let input_metadata = crate::InputMetadata {
+                is_prefill: true,
+                sequence_ids: None,
+                mamba_slot_mapping: None,
+                slot_mapping,
+                block_tables: None,
+                context_lens: None,
+                cu_seqlens_q: Some(cu_seqlens.clone()),
+                cu_seqlens_k: Some(cu_seqlens),
+                max_seqlen_q: prompt_len,
+                max_seqlen_k: prompt_len,
+                max_context_len: 0,
+                disable_flash_attn: None,
+                seqlens: Some(vec![prompt_len as u32]),
+                flashinfer_metadata: None,
+            };
+            info!(
+                prompt_len,
+                max_hidden_states,
+                "embedded runtime invoking forward_internalize_states"
+            );
+            pipeline
+                .0
+                .forward_internalize_states(tokens, &positions, &input_metadata, max_hidden_states)?
+        };
+        info!(
+            hidden_states = hidden_states.len(),
+            "embedded runtime completed forward_internalize_states"
+        );
+
+        Ok(AdapterContextCapture {
+            prompt_ids,
+            hidden_states,
+        })
     }
 
     fn default_session_sampling_params(&self) -> CandleResult<SamplingParams> {
