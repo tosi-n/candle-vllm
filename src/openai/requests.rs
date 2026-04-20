@@ -55,7 +55,7 @@ pub enum Messages {
     Literal(String),
 }
 
-fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
+pub fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
     match content {
         Some(MessageContentType::PureText(text)) => text.clone(),
         Some(MessageContentType::Single(item)) => match item {
@@ -72,6 +72,10 @@ fn extract_text_from_content(content: Option<&MessageContentType>) -> String {
             .join(" "),
         None => String::new(),
     }
+}
+
+pub fn extract_text_from_required_content(content: &MessageContentType) -> String {
+    extract_text_from_content(Some(content))
 }
 
 pub fn normalize_empty_openai_tool_results(messages: &mut [ChatMessage]) {
@@ -260,6 +264,28 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<crate::tools::Tool>>,
     #[serde(default)]
     pub tool_choice: Option<crate::tools::ToolChoice>,
+    #[serde(default)]
+    pub metadata: Option<ChatCompletionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatCompletionMetadata {
+    #[serde(default)]
+    pub runtime: Option<RuntimeRequestMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeRequestMetadata {
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub adapter_schedule: Option<Vec<AdapterScheduleStep>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterScheduleStep {
+    pub start_step: usize,
+    pub adapter_id: String,
 }
 
 impl Default for ChatCompletionRequest {
@@ -290,6 +316,7 @@ impl Default for ChatCompletionRequest {
             thinking: None,
             tools: None,
             tool_choice: None,
+            metadata: None,
         }
     }
 }

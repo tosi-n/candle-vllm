@@ -7,10 +7,16 @@ use axum::{
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "nccl")]
 use candle_vllm::backend::heartbeat;
+use candle_vllm::openai::lora::{set_global_lora_manager, LoRAManager};
 use candle_vllm::openai::models::Config;
-use candle_vllm::openai::openai_server::{chat_completions, create_embeddings};
+use candle_vllm::openai::openai_server::{
+    adapters_status, chat_completions, create_embeddings, get_adapter, list_adapters, load_adapter,
+    register_adapter, unload_adapter, warmup_adapters,
+};
 use candle_vllm::openai::pipelines::llm_engine::LLMEngine;
 use candle_vllm::openai::pipelines::pipeline::DefaultLoader;
+use candle_vllm::openai::runtime_internal::proto::runtime_internal_server::RuntimeInternalServer;
+use candle_vllm::openai::runtime_internal::{RuntimeInternalService, RuntimeKvProfile};
 use candle_vllm::openai::sampling_params::GenerationConfig;
 use candle_vllm::openai::{kv_cache_capacity_tokens, OpenAIServerData};
 use candle_vllm::scheduler::cache_engine::{CacheConfig, CacheEngine};
@@ -19,10 +25,14 @@ use candle_vllm::scheduler::SchedulerConfig;
 use clap::Parser;
 use colored::*;
 use local_ip_address::local_ip;
+use parking_lot::RwLock;
 use rustchatui::start_ui_server;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use tonic::transport::Server;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 #[derive(Parser, Debug)]
@@ -158,6 +168,30 @@ struct Args {
     #[arg(long)]
     mcp_config: Option<String>,
 
+    /// Enforce runtime-node boundary: public API accepts only local execution mode/scope.
+    #[arg(long, default_value_t = true)]
+    runtime_local_only_strict: bool,
+
+    /// Canonical model id to advertise in runtime metadata, adapter compatibility, and KV handoff.
+    #[arg(long)]
+    runtime_canonical_model_id: Option<String>,
+
+    /// Enable internal runtime gRPC APIs for KV handoff and adapter runtime ops.
+    #[arg(long, default_value_t = false)]
+    runtime_internal_api: bool,
+
+    /// Internal runtime gRPC bind host.
+    #[arg(long, default_value = "127.0.0.1")]
+    runtime_internal_grpc_host: String,
+
+    /// Internal runtime gRPC bind port.
+    #[arg(long, default_value_t = 51051)]
+    runtime_internal_grpc_port: u16,
+
+    /// Max chunk size (bytes) for KV export/import streaming.
+    #[arg(long, default_value_t = 1_048_576)]
+    runtime_internal_chunk_bytes: usize,
+
     /// Force a specific tool parser backend (for example: qwen, qwen_coder, json, mistral).
     #[arg(long)]
     enforce_parser: Option<String>,
@@ -206,6 +240,43 @@ async fn bind_api_listener(bind_addr: &str) -> Result<tokio::net::TcpListener> {
     })
 }
 
+fn normalize_model_id_arg(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn derive_runtime_model_id(
+    runtime_canonical_model_id: Option<&str>,
+    model_id: Option<&str>,
+    weight_path: Option<&str>,
+    pipeline_name: &str,
+) -> String {
+    if let Some(model_id) = runtime_canonical_model_id.and_then(normalize_model_id_arg) {
+        return model_id;
+    }
+
+    if let Some(model_id) = model_id.and_then(normalize_model_id_arg) {
+        return model_id;
+    }
+
+    if let Some(weight_path) = weight_path.and_then(normalize_model_id_arg) {
+        let basename = Path::new(&weight_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .or_else(|| weight_path.rsplit('/').next().map(str::to_string));
+        if let Some(name) = basename.filter(|name| !name.trim().is_empty()) {
+            return name;
+        }
+    }
+
+    normalize_model_id_arg(pipeline_name).unwrap_or_else(|| pipeline_name.to_string())
+}
+
 #[tokio::main]
 #[allow(unused_mut)]
 async fn main() -> Result<()> {
@@ -216,9 +287,12 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    let requested_model_id = args.model_id.clone();
+    let requested_weight_path = args.weight_path.clone();
+
     let loader = Box::new(DefaultLoader::new(
-        args.model_id,
-        args.weight_path,
+        requested_model_id.clone(),
+        requested_weight_path.clone(),
         args.weight_file,
         args.enforce_parser.clone(),
         args.yarn_scaling_factor,
@@ -609,12 +683,60 @@ async fn main() -> Result<()> {
         None
     };
 
+    let runtime_canonical_model_id = args.runtime_canonical_model_id.clone();
+    let runtime_model_name = {
+        let engine = llm_engine.read();
+        let (pipeline, _) = engine
+            .get_pipeline(0)
+            .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
+        derive_runtime_model_id(
+            runtime_canonical_model_id.as_deref(),
+            requested_model_id.as_deref(),
+            requested_weight_path.as_deref(),
+            pipeline.name(),
+        )
+    };
+    let lora_manager = Arc::new(LoRAManager::new(
+        Some(runtime_model_name.clone()),
+        8,
+        64,
+        "fallback",
+    ));
+    set_global_lora_manager(Arc::clone(&lora_manager));
+
+    let runtime_dtype = format!("{:?}", cache_config.dtype).to_lowercase();
+    let runtime_kv_profile = RuntimeKvProfile {
+        model_id: runtime_model_name.clone(),
+        model_hash: RuntimeInternalService::model_hash(
+            &runtime_model_name,
+            &runtime_dtype,
+            cache_config.block_size,
+            config.num_hidden_layers,
+            config
+                .num_key_value_heads
+                .unwrap_or(config.num_attention_heads)
+                / num_shards,
+            config.k_head_dim(),
+        ),
+        dtype: runtime_dtype,
+        block_size: cache_config.block_size,
+        num_layers: config.num_hidden_layers,
+        kv_heads: config
+            .num_key_value_heads
+            .unwrap_or(config.num_attention_heads)
+            / num_shards,
+        head_dim: config.k_head_dim(),
+    };
+
     let server_data = OpenAIServerData {
         pipeline_config,
         model: llm_engine,
         record_conversation: args.record_conversation,
         device: Device::Cpu,
+        runtime_local_only_strict: args.runtime_local_only_strict,
         mcp_manager: mcp_manager.clone(),
+        lora_manager,
+        session_adapters: Arc::new(RwLock::new(HashMap::new())),
     };
 
     if let Some(manager) = &mcp_manager {
@@ -637,6 +759,9 @@ async fn main() -> Result<()> {
         daemon_manager.as_mut().unwrap().mpi_sync();
     }
 
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    LLMEngine::graph_capture(&server_data.model).unwrap();
+
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([http::header::CONTENT_TYPE])
@@ -644,11 +769,25 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let shared_server_data = Arc::new(server_data);
     let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|State(data): State<Arc<OpenAIServerData>>| async move {
+                let lora_status = data.lora_manager.status();
+                Json(json!({
+                    "status": "ok",
+                    "runtime_local_only_strict": data.runtime_local_only_strict,
+                    "max_active_loras": lora_status.max_active_loras,
+                    "loaded_loras": lora_status.loaded_loras,
+                    "lora_mode": lora_status.lora_mode
+                }))
+            }),
+        )
         .route(
             "/v1/models",
             get(|State(data): State<Arc<OpenAIServerData>>| async move {
-                let (model_name, modalities) = {
+                let (model_name, modalities, lora_status) = {
                     let engine = data.model.read();
                     let (pipeline, _) = engine.get_pipeline(0).unwrap();
                     let modalities = if pipeline.image_config.is_some() {
@@ -656,7 +795,7 @@ async fn main() -> Result<()> {
                     } else {
                         vec!["text", "embedding"]
                     };
-                    (pipeline.name().to_string(), modalities)
+                    (pipeline.name().to_string(), modalities, data.lora_manager.status())
                 };
                 Json(json!({
                     "object": "list",
@@ -672,6 +811,9 @@ async fn main() -> Result<()> {
                             "permission": [],
                             "modalities": modalities,
                             "max_model_len": data.pipeline_config.max_model_len,
+                            "max_active_loras": lora_status.max_active_loras,
+                            "loaded_loras": lora_status.loaded_loras,
+                            "lora_mode": lora_status.lora_mode
                         }
                     ]
                 }))
@@ -679,8 +821,14 @@ async fn main() -> Result<()> {
         )
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(create_embeddings))
+        .route("/v1/adapters", post(register_adapter).get(list_adapters))
+        .route("/v1/adapters/status", get(adapters_status))
+        .route("/v1/adapters/warmup", post(warmup_adapters))
+        .route("/v1/adapters/{id}", get(get_adapter))
+        .route("/v1/adapters/{id}/load", post(load_adapter))
+        .route("/v1/adapters/{id}/unload", post(unload_adapter))
         .layer(cors_layer)
-        .with_state(Arc::new(server_data));
+        .with_state(Arc::clone(&shared_server_data));
 
     let bind_addr = format!("{host}:{port}");
     let listener = bind_api_listener(&bind_addr).await?;
@@ -723,6 +871,28 @@ async fn main() -> Result<()> {
             candle_core::Error::msg(format!("Chat API server error on {bind_addr}: {e}"))
         })
     }));
+
+    if args.runtime_internal_api && global_rank == 0 {
+        let grpc_addr = format!(
+            "{}:{}",
+            args.runtime_internal_grpc_host, args.runtime_internal_grpc_port
+        )
+        .parse()
+        .map_err(candle_core::Error::wrap)?;
+        let internal_service = RuntimeInternalService::new(
+            Arc::clone(&shared_server_data.model),
+            Arc::clone(&shared_server_data.lora_manager),
+            runtime_kv_profile,
+            args.runtime_internal_chunk_bytes,
+        );
+        tasks.push(tokio::spawn(async move {
+            Server::builder()
+                .add_service(RuntimeInternalServer::new(internal_service))
+                .serve(grpc_addr)
+                .await
+                .map_err(candle_core::Error::wrap)
+        }));
+    }
 
     // Usage example: https://github.com/guoqingbao/rustchatui/blob/main/ReadMe.md
     if args.ui_server && global_rank == 0 {

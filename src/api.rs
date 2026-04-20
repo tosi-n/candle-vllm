@@ -595,6 +595,8 @@ impl Engine {
                 Some(req_notify.clone()),
                 false,
                 prefilled_reasoning_end,
+                None,
+                None,
             );
             self.notify.notify_one();
         }
@@ -718,6 +720,8 @@ impl Engine {
                 Some(std::sync::Arc::new(tx)),
                 None,
                 false,
+                None,
+                None,
                 None,
             );
             self.notify.notify_one();

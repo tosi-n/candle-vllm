@@ -2090,9 +2090,8 @@ impl FusedMoeNvfp4 {
         };
 
         let pre_sorted = if is_prefill {
-            use attention_rs::sort::ArgSortOp;
             let flat = topk_ids.flatten_all()?.contiguous()?;
-            let (eids, tids) = flat.sort(true)?;
+            let (eids, tids) = flat.sort_last_dim(true)?;
             Some((tids, eids))
         } else {
             None

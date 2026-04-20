@@ -118,6 +118,9 @@ impl MultiprocessRunner {
                 task.tools.clone(),
                 None,
                 task.include_usage,
+                task.adapter_id.clone(),
+                task.adapter_schedule.clone(),
+                None,
             );
             if task.prefilled_reasoning_end.is_some() {
                 seq_group.active_reasoning_end = task.prefilled_reasoning_end.clone();

@@ -41,6 +41,18 @@ pub struct SchedulerOutput {
     pub ignored_seq_groups: Arc<VecDeque<Arc<SequenceGroup>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionLookup {
+    pub request_id: String,
+    pub seq_id: usize,
+    pub prompt_ids: Vec<u32>,
+    pub prompt_len: usize,
+    pub total_len: usize,
+    pub adapter_id: Option<String>,
+    pub sampling_params: crate::openai::sampling_params::SamplingParams,
+    pub block_ids: Vec<usize>,
+}
+
 pub struct SchedulerConfig {
     pub max_num_seqs: usize,
     pub prefix_cache: PrefixCacheConfig,
@@ -167,6 +179,10 @@ impl Scheduler {
         let mut preempted = VecDeque::new();
         while !self.running.is_empty() {
             let seq_group = self.running.pop_front().unwrap();
+            if seq_group.is_decode_blocked() {
+                running.push_back(seq_group);
+                continue;
+            }
             let mut finished_with_break = false;
             while !self.block_engine.can_append_token_to_seq(&seq_group) {
                 // If we cannot, now we need to preempt some seqs
@@ -293,6 +309,54 @@ impl Scheduler {
     pub fn get_available_kv_tokens(&self) -> usize {
         let free_blocks = self.block_engine.get_num_free_blocks();
         free_blocks * self.block_engine.get_block_size()
+    }
+
+    pub fn lookup_session(&self, request_id: &str) -> Option<SessionLookup> {
+        for queue in [&self.waiting, &self.running, &self.swapped_out] {
+            if let Some(group) = queue.iter().find(|group| group.request_id == request_id) {
+                let seq = group.get_seqs().values().next()?;
+                let seq_guard = seq.deref();
+                let seq_id = seq_guard.get_id();
+                let block_ids = self
+                    .block_engine
+                    .block_tables
+                    .get(&seq_id)
+                    .map(|table| {
+                        table
+                            .iter()
+                            .map(|block| block.deref_mut().block_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                return Some(SessionLookup {
+                    request_id: group.request_id.clone(),
+                    seq_id,
+                    prompt_ids: seq_guard.get_token_ids(),
+                    prompt_len: seq_guard.get_prompt_len(),
+                    total_len: seq_guard.get_len(),
+                    adapter_id: group.adapter_id.clone(),
+                    sampling_params: group.sampling_params.clone(),
+                    block_ids,
+                });
+            }
+        }
+        None
+    }
+
+    pub fn abort_session_by_request_id(&mut self, request_id: &str) -> bool {
+        let target = self
+            .waiting
+            .iter()
+            .chain(self.running.iter())
+            .chain(self.swapped_out.iter())
+            .find(|group| group.request_id == request_id)
+            .cloned();
+        if let Some(group) = target {
+            self._abort_seq_group(&group);
+            return true;
+        }
+        false
     }
 
     pub fn filter_prefill_finished(
