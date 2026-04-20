@@ -125,20 +125,43 @@ pub fn get_cache_config(
     let kv_layers = config.kv_cache_num_layers().max(1);
     let dsize = kv_dtype.size_in_bytes();
     let size_in_mb = 1024 * 1024;
-    let num_gpu_blocks = kvcache_mem_gpu * size_in_mb
-        / dsize
-        / block_size
-        / (config.num_key_value_heads.unwrap() / num_shards)
-        / config.k_head_dim()
-        / kv_layers
-        / 2;
-    let num_cpu_blocks = kvcache_mem_cpu * size_in_mb
-        / dsize
-        / block_size
-        / (config.num_key_value_heads.unwrap() / num_shards)
-        / config.k_head_dim()
-        / kv_layers
-        / 2;
+    let (num_gpu_blocks, num_cpu_blocks) = if config.is_mla() {
+        let per_block = block_size
+            * (config.mla_kv_lora_rank() + config.mla_qk_rope_head_dim())
+            * dsize
+            * kv_layers;
+        let gpu = kvcache_mem_gpu * size_in_mb / per_block.max(1);
+        let cpu = kvcache_mem_cpu * size_in_mb / per_block.max(1);
+        (gpu, cpu)
+    } else if let Some(per_layer_cfg) = config.gemma4_per_layer_cache_config() {
+        // For Gemma4 with heterogeneous head_dim, calculate per-layer cache size
+        let mut total_per_block_bytes = 0usize;
+        for &(kv_heads, head_dim) in &per_layer_cfg {
+            let kv_heads_sharded = kv_heads / num_shards;
+            // 2 for key and value tensors
+            total_per_block_bytes += block_size * kv_heads_sharded * head_dim * dsize * 2;
+        }
+        let per_block = total_per_block_bytes.max(1);
+        let gpu = kvcache_mem_gpu * size_in_mb / per_block;
+        let cpu = kvcache_mem_cpu * size_in_mb / per_block;
+        (gpu, cpu)
+    } else {
+        let num_gpu_blocks = kvcache_mem_gpu * size_in_mb
+            / dsize
+            / block_size
+            / (config.num_key_value_heads.unwrap() / num_shards)
+            / config.k_head_dim()
+            / kv_layers
+            / 2;
+        let num_cpu_blocks = kvcache_mem_cpu * size_in_mb
+            / dsize
+            / block_size
+            / (config.num_key_value_heads.unwrap() / num_shards)
+            / config.k_head_dim()
+            / kv_layers
+            / 2;
+        (num_gpu_blocks, num_cpu_blocks)
+    };
     crate::scheduler::cache_engine::CacheConfig {
         block_size,
         num_gpu_blocks: Some(num_gpu_blocks),
@@ -151,8 +174,20 @@ pub fn get_cache_config(
 }
 
 const SIZE_IN_MB: usize = 1024 * 1024;
-pub const MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV: &str = "VLLM_RS_MAMBA_SNAPSHOT_STRIDE_BLOCKS";
-pub const DEFAULT_MAMBA_SNAPSHOT_BLOCK_STRIDE: usize = 8;
+pub const MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV: &str = "CANDLE_VLLM_MAMBA_SNAPSHOT_STRIDE_BLOCKS";
+pub const DEFAULT_MAMBA_SNAPSHOT_BLOCK_STRIDE: usize = 1;
+
+pub const STREAM_AS_REASONING_CONTENT_ENV: &str = "CANDLE_VLLM_STREAM_AS_REASONING_CONTENT";
+
+static STREAM_AS_REASONING_CONTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn stream_as_reasoning_content() -> bool {
+    *STREAM_AS_REASONING_CONTENT.get_or_init(|| {
+        std::env::var(STREAM_AS_REASONING_CONTENT_ENV)
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceMemoryReport {

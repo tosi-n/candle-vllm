@@ -1,16 +1,19 @@
+use super::quantized_qwen3_5::{parse_gguf_hybrid_config, QuantizedGatedDeltaNet};
 use super::rotary_emb::ScalingRotaryEmbedding;
 use super::{attention::QuantizedAttention, Config, MoEConfig, QwenMoEConfig};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
 use crate::openai::models::linear::Linear;
 use crate::openai::models::mask::get_attention_causal_mask;
+use crate::openai::models::quantized_qwen3_5::build_extra_config_json;
+use crate::openai::models::utils::{resolve_input_seqlens, resolve_mamba_seq_slots};
 use crate::InputMetadata;
+use attention_rs::mamba_cache::MambaCache;
 use candle_core::quantized::{gguf_file, QMatMul};
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
 use either::Either;
-use parking_lot::RwLock;
-use std::iter::zip;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -47,7 +50,6 @@ impl FusedMoe {
         let router_logits = self.gate.forward(&xs)?;
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
-        //last dim size 128
         let indices = routing_weights
             .arg_sort_last_dim(false)?
             .narrow(D::Minus1, 0, self.num_experts_per_tok)?
@@ -89,8 +91,13 @@ impl MoeOrMlp {
     }
 }
 
+enum AttnType {
+    FullAttention(QuantizedAttention),
+    LinearAttention(QuantizedGatedDeltaNet),
+}
+
 struct LayerWeights {
-    self_attn: QuantizedAttention,
+    attn: AttnType,
     attention_norm: QRmsNorm,
     mlp: MoeOrMlp,
     shared_gate: Option<Linear>,
@@ -99,35 +106,28 @@ struct LayerWeights {
 }
 
 impl LayerWeights {
-    fn forward_attn(
-        &self,
-        x: &Tensor,
-        mask: Option<&Vec<Tensor>>,
-        input_positions: &Tensor,
-        cache: Option<(&Tensor, &Tensor)>,
-        input_metadata: &InputMetadata,
-    ) -> Result<Tensor> {
-        self.self_attn
-            .forward(x, mask, input_positions, cache, input_metadata)
+    #[allow(dead_code)]
+    fn is_full_attention(&self) -> bool {
+        matches!(self.attn, AttnType::FullAttention(_))
     }
 }
 
-pub struct GGUFQWenMoE {
+pub struct GGUFQWen3_5MoE {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
     norm: QRmsNorm,
     output: QMatMul,
+    mamba_cache: RwLock<MambaCache>,
     cfg: Config,
     dtype: DType,
     device: Device,
 }
 
-impl GGUFQWenMoE {
+impl GGUFQWen3_5MoE {
     pub fn into_config(
         arch: String,
         embedding_length: usize,
         head_dim: usize,
-        i_size: usize,
         block_count: usize,
         head_count: usize,
         head_count_kv: usize,
@@ -138,12 +138,13 @@ impl GGUFQWenMoE {
         partial_rotary_factor: Option<f32>,
         moe_cfg: &QwenMoEConfig,
         kv_cache_dtype: DType,
+        extra_config_json: Option<String>,
     ) -> Config {
         Config {
             architectures: Some(vec![arch]),
             hidden_size: embedding_length,
             head_dim: Some(head_dim),
-            intermediate_size: i_size,
+            intermediate_size: 0,
             vocab_size: 0,
             num_hidden_layers: block_count,
             num_attention_heads: head_count,
@@ -173,7 +174,7 @@ impl GGUFQWenMoE {
             moe_config: Some(MoEConfig::QwenMoE(moe_cfg.clone())),
             isq_quant: None,
             fp8_kvcache: Some(kv_cache_dtype == DType::U8),
-            extra_config_json: None,
+            extra_config_json,
         }
     }
 
@@ -197,7 +198,6 @@ impl GGUFQWenMoE {
             md_get(format!("{arch}.attention.head_count").as_str())?.to_u32()? as usize;
         let head_count_kv =
             md_get(format!("{arch}.attention.head_count_kv").as_str())?.to_u32()? as usize;
-
         let head_dim = md_get(format!("{arch}.attention.key_length").as_str());
         let embedding_length =
             md_get(format!("{arch}.embedding_length").as_str())?.to_u32()? as usize;
@@ -213,6 +213,7 @@ impl GGUFQWenMoE {
         let rope_freq_base = md_get(format!("{arch}.rope.freq_base").as_str())
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
+
         let expert_shared_feed_forward_length =
             md_get(format!("{arch}.expert_shared_feed_forward_length").as_str());
         let shared_expert_intermediate_size = match expert_shared_feed_forward_length {
@@ -226,6 +227,13 @@ impl GGUFQWenMoE {
             _ => None,
         };
 
+        let expert_weights_norm = md_get(format!("{arch}.expert_weights_norm").as_str())
+            .ok()
+            .and_then(|v| v.to_bool().ok());
+        let expert_weights_scale = md_get(format!("{arch}.expert_weights_scale").as_str())
+            .ok()
+            .and_then(|v| v.to_f64().ok());
+
         let moe_cfg = QwenMoEConfig {
             moe_intermediate_size: md_get(format!("{arch}.expert_feed_forward_length").as_str())?
                 .to_u32()? as usize,
@@ -233,26 +241,12 @@ impl GGUFQWenMoE {
             num_experts: Some(md_get(format!("{arch}.expert_count").as_str())?.to_u32()? as usize),
             mlp_only_layers: Some(vec![]),
             decoder_sparse_step: Some(1),
-            norm_topk_prob: shared_expert_intermediate_size.is_none(),
+            norm_topk_prob: expert_weights_norm.unwrap_or(true),
             num_experts_per_tok: md_get(format!("{arch}.expert_used_count").as_str())?.to_u32()?
                 as usize,
-            routed_scaling_factor: None,
+            routed_scaling_factor: expert_weights_scale,
             first_k_dense_replace: None,
             n_shared_experts: None,
-        };
-
-        let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::from_qtensor(
-            ct.tensor(reader, "output_norm.weight", device)?,
-            rms_norm_eps,
-        )?;
-        let output = match ct.tensor(reader, "output.weight", device) {
-            Ok(v) => QMatMul::from_qtensor(v)?,
-            _ => {
-                // use tie_word_embeddings
-                QMatMul::from_qtensor(ct.tensor(reader, "token_embd.weight", device)?)?
-            }
         };
 
         let original_max_position_embeddings =
@@ -274,11 +268,14 @@ impl GGUFQWenMoE {
         } else {
             None
         };
-        let mut cfg = GGUFQWenMoE::into_config(
+
+        let hybrid = parse_gguf_hybrid_config(ct, &arch, block_count);
+        let extra_config_json = build_extra_config_json(&hybrid, &arch);
+
+        let mut cfg = GGUFQWen3_5MoE::into_config(
             arch.clone(),
             embedding_length,
             head_dim,
-            0,
             block_count,
             head_count,
             head_count_kv,
@@ -289,13 +286,58 @@ impl GGUFQWenMoE {
             partial_rotary_factor,
             &moe_cfg,
             kv_cache_dtype,
+            Some(extra_config_json),
         );
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
 
+        let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
+        let tok_embeddings = tok_embeddings.dequantize(device)?;
+        let norm = QRmsNorm::from_qtensor(
+            ct.tensor(reader, "output_norm.weight", device)?,
+            rms_norm_eps,
+        )?;
+        let output = match ct.tensor(reader, "output.weight", device) {
+            Ok(v) => QMatMul::from_qtensor(v)?,
+            _ => QMatMul::from_qtensor(ct.tensor(reader, "token_embd.weight", device)?)?,
+        };
+
+        let layer_types = &hybrid.layer_types;
         let mut layers = Vec::with_capacity(block_count);
+        let mut gdn_layer_idx = 0usize;
+
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
+            let layer_type = layer_types
+                .get(layer_idx)
+                .map(String::as_str)
+                .unwrap_or("full_attention");
+
+            let attn = if layer_type == "full_attention" {
+                AttnType::FullAttention(QuantizedAttention::new(
+                    &cfg,
+                    ct,
+                    reader,
+                    &prefix,
+                    device,
+                    dtype,
+                    rotary_emb.clone(),
+                    cfg.sliding_window,
+                )?)
+            } else {
+                let cur_gdn_idx = gdn_layer_idx;
+                gdn_layer_idx += 1;
+                AttnType::LinearAttention(QuantizedGatedDeltaNet::new(
+                    ct,
+                    reader,
+                    &prefix,
+                    device,
+                    &hybrid,
+                    cur_gdn_idx,
+                    rms_norm_eps,
+                )?)
+            };
+
             let mlp = if !moe_cfg
                 .mlp_only_layers
                 .as_ref()
@@ -320,7 +362,6 @@ impl GGUFQWenMoE {
                     norm_topk_prob: moe_cfg.norm_topk_prob,
                     num_experts_per_tok: moe_cfg.num_experts_per_tok,
                 };
-
                 MoeOrMlp::FusedMoe(moe)
             } else {
                 let mlp = {
@@ -341,9 +382,12 @@ impl GGUFQWenMoE {
 
             let attention_norm =
                 ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
-            let ffn_norm = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
+            let ffn_norm = ct.tensor(
+                reader,
+                &format!("{prefix}.post_attention_norm.weight"),
+                device,
+            )?;
 
-            //shared experts weights in Qwen2 MoE models
             let (shared_gate, shared_expert) =
                 if let Some(_) = moe_cfg.shared_expert_intermediate_size {
                     let ws = ct
@@ -353,7 +397,7 @@ impl GGUFQWenMoE {
                             device,
                         )?
                         .dequantize(device)?
-                        .reshape((1, cfg.hidden_size))?; //weight must be 2d+
+                        .reshape((1, cfg.hidden_size))?;
 
                     let shared_gate = Linear::new(ws, None);
 
@@ -370,24 +414,13 @@ impl GGUFQWenMoE {
                             feed_forward_w3: QMatMul::from_qtensor(feed_forward_w3)?,
                         }
                     };
-
                     (Some(shared_gate), Some(mlp))
                 } else {
                     (None, None)
                 };
 
-            let self_attn = QuantizedAttention::new(
-                &cfg,
-                ct,
-                reader,
-                &prefix,
-                device,
-                dtype,
-                rotary_emb.clone(),
-                cfg.sliding_window,
-            )?;
             layers.push(LayerWeights {
-                self_attn,
+                attn,
                 attention_norm: QRmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 mlp,
                 shared_gate,
@@ -397,15 +430,46 @@ impl GGUFQWenMoE {
             reporter.write().set_progress(layer_idx + 1);
         }
 
+        let num_gdn_layers = gdn_layer_idx;
+        let num_v_heads = hybrid.num_v_heads;
+        let num_k_heads = hybrid.num_k_heads;
+        let d_conv = num_k_heads * hybrid.key_head_dim * 2 + num_v_heads * hybrid.value_head_dim;
+
+        let mamba_cache = if num_gdn_layers > 0 {
+            MambaCache::new(
+                num_gdn_layers,
+                1,
+                d_conv,
+                hybrid.conv_kernel_size,
+                num_v_heads,
+                hybrid.key_head_dim,
+                hybrid.value_head_dim,
+                DType::F32,
+                DType::F32,
+                device,
+            )?
+        } else {
+            MambaCache::new(0, 1, 1, 2, 1, 1, 1, DType::F32, DType::F32, device)?
+        };
+
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
             norm,
             output,
+            mamba_cache: RwLock::new(mamba_cache),
             cfg,
             dtype,
             device: device.clone(),
         })
+    }
+
+    pub fn embed_forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(input_ids)
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     pub fn forward(
@@ -415,7 +479,7 @@ impl GGUFQWenMoE {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        self.forward_inner(x, input_positions, kv_caches, input_metadata, false)
+        self.forward_inner(x, input_positions, kv_caches, input_metadata, false, false)
     }
 
     pub fn forward_embedding(
@@ -425,7 +489,27 @@ impl GGUFQWenMoE {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        self.forward_inner(x, input_positions, kv_caches, input_metadata, true)
+        self.forward_inner(x, input_positions, kv_caches, input_metadata, true, false)
+    }
+
+    pub fn forward_with_deepstack(
+        &self,
+        x: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embedded_inputs: bool,
+        _visual_pos_masks: &Option<Tensor>,
+        _deepstack_visual_embeds: &Option<Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            x,
+            input_positions,
+            kv_caches,
+            input_metadata,
+            false,
+            embedded_inputs,
+        )
     }
 
     fn forward_inner(
@@ -435,17 +519,9 @@ impl GGUFQWenMoE {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
         return_hidden: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
-        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
-            input_metadata
-                .cu_seqlens_q
-                .as_ref()
-                .unwrap()
-                .to_vec1::<u32>()?[1..]
-                .into()
-        } else {
-            Vec::new()
-        };
+        let seqlens = resolve_input_seqlens(input_metadata)?;
         let attention_mask = get_attention_causal_mask(
             &self.device,
             self.dtype,
@@ -454,76 +530,65 @@ impl GGUFQWenMoE {
             self.cfg.sliding_window,
             input_metadata.is_prefill,
         );
-        let mut xs = self.tok_embeddings.forward(x)?;
-        if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
-                let x = xs;
-                let residual = &x;
-                let x = layer.attention_norm.forward(&x)?;
-                let attn = layer.forward_attn(
-                    &x,
-                    attention_mask.as_ref(),
-                    input_positions,
-                    Some((k_cache, v_cache)),
-                    input_metadata,
-                )?;
-                let x = (attn + residual)?;
-
-                // MLP
-                let residual = &x;
-                let x = layer.ffn_norm.forward(&x)?;
-
-                //shared experts for Qwen2 MoE models
-                let shared_output = match (&layer.shared_gate, &layer.shared_expert) {
-                    (Some(shared_gate), Some(shared_expert)) => {
-                        let gate = candle_nn::ops::sigmoid(&shared_gate.forward(&x)?)?;
-                        let shared_output = shared_expert.forward(&x)?;
-                        Some(gate.broadcast_mul(&shared_output)?)
-                    }
-                    _ => None,
-                };
-                let x = layer.mlp.forward(&x)?;
-                let x = if let Some(shared_output) = shared_output {
-                    (residual + (x + shared_output)?)?
-                } else {
-                    (x + residual)?
-                };
-                xs = x
-            }
+        let mut xs = if embedded_inputs {
+            x.clone()
         } else {
-            for layer in self.layers.iter() {
-                let x = xs;
-                let residual = &x;
-                let x = layer.attention_norm.forward(&x)?;
-                let attn = layer.forward_attn(
-                    &x,
-                    attention_mask.as_ref(),
-                    input_positions,
-                    None,
-                    input_metadata,
-                )?;
-                let x = (attn + residual)?;
+            self.tok_embeddings.forward(x)?
+        };
 
-                // MLP
-                let residual = &x;
-                let x = layer.ffn_norm.forward(&x)?;
-                //shared experts for Qwen2 MoE models
-                let shared_output = match (&layer.shared_gate, &layer.shared_expert) {
-                    (Some(shared_gate), Some(shared_expert)) => {
-                        let gate = candle_nn::ops::sigmoid(&shared_gate.forward(&x)?)?;
-                        let shared_output = shared_expert.forward(&x)?;
-                        Some(gate.broadcast_mul(&shared_output)?)
-                    }
-                    _ => None,
-                };
-                let x = layer.mlp.forward(&x)?;
-                let x = if let Some(shared_output) = shared_output {
-                    (residual + (x + shared_output)?)?
-                } else {
-                    (x + residual)?
-                };
-                xs = x
-            }
+        let mut mamba_cache = self.mamba_cache.write();
+        let seq_slots = resolve_mamba_seq_slots(
+            "Qwen3.5 MoE GGUF",
+            &self.device,
+            input_metadata,
+            xs.dim(0)?,
+            &mut mamba_cache,
+        )?;
+
+        let mut kv_cache_idx = 0usize;
+        for layer in self.layers.iter() {
+            let residual = &xs;
+            let x = layer.attention_norm.forward(&xs)?;
+            let x = match &layer.attn {
+                AttnType::FullAttention(attn) => {
+                    let cache = if let Some(kv_caches) = kv_caches {
+                        let c = &kv_caches[kv_cache_idx];
+                        kv_cache_idx += 1;
+                        Some((&c.0, &c.1))
+                    } else {
+                        None
+                    };
+                    attn.forward(
+                        &x,
+                        attention_mask.as_ref(),
+                        input_positions,
+                        cache,
+                        input_metadata,
+                    )?
+                }
+                AttnType::LinearAttention(gdn) => {
+                    gdn.forward(&x, &mut mamba_cache, input_metadata, &seq_slots)?
+                }
+            };
+            let x = (x + residual)?;
+
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+
+            let shared_output = match (&layer.shared_gate, &layer.shared_expert) {
+                (Some(shared_gate), Some(shared_expert)) => {
+                    let gate = candle_nn::ops::sigmoid(&shared_gate.forward(&x)?)?;
+                    let shared_output = shared_expert.forward(&x)?;
+                    Some(gate.broadcast_mul(&shared_output)?)
+                }
+                _ => None,
+            };
+            let x = layer.mlp.forward(&x)?;
+            xs = if let Some(shared_output) = shared_output {
+                (residual + (x + shared_output)?)?
+            } else {
+                (x + residual)?
+            };
         }
 
         if !seqlens.is_empty() && !return_hidden {
@@ -541,5 +606,60 @@ impl GGUFQWenMoE {
 
     pub fn get_config(&self) -> &Config {
         &self.cfg
+    }
+
+    pub fn release_sequence_state(&self, sequence_id: usize) {
+        self.mamba_cache.write().free_slot(sequence_id);
+    }
+
+    pub fn ensure_mamba_slots_for_sequences(&self, sequence_ids: &[usize]) -> Result<Vec<usize>> {
+        self.mamba_cache
+            .write()
+            .ensure_slots_for_sequences(sequence_ids)
+    }
+
+    pub fn get_mamba_slots_for_sequences(&self, sequence_ids: &[usize]) -> Result<Vec<usize>> {
+        self.mamba_cache
+            .write()
+            .get_slots_for_sequences(sequence_ids)
+    }
+
+    pub fn has_mamba_slot_for_sequence(&self, sequence_id: usize) -> bool {
+        self.mamba_cache.read().get_slot(sequence_id).is_some()
+    }
+
+    pub fn lock_mamba_cache_for_graph(&self) -> RwLockWriteGuard<'_, MambaCache> {
+        self.mamba_cache.write()
+    }
+
+    pub fn preallocate_mamba_cache(&self, max_num_seqs: usize) -> Result<()> {
+        self.mamba_cache.write().reserve_capacity(max_num_seqs)
+    }
+
+    pub fn set_mamba_prefix_cache_capacity(&self, capacity: usize) {
+        self.mamba_cache.write().set_prefix_cache_capacity(capacity);
+    }
+
+    pub fn capture_mamba_prefix_state(
+        &self,
+        seq_id: usize,
+        hash: u64,
+        preserve: bool,
+    ) -> Result<bool> {
+        self.mamba_cache
+            .write()
+            .capture_prefix_state(seq_id, hash, preserve)
+    }
+
+    pub fn has_mamba_prefix_state(&self, hash: u64) -> bool {
+        self.mamba_cache.write().has_prefix_state(hash)
+    }
+
+    pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
+        self.mamba_cache.write().restore_prefix_state(seq_id, hash)
+    }
+
+    pub fn reset_mamba_cache(&self) -> Result<()> {
+        self.mamba_cache.write().reset_all()
     }
 }

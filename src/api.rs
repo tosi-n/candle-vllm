@@ -1,11 +1,11 @@
 use crate::openai::models::Config;
+use crate::openai::multimodal::build_messages_and_images;
 use crate::openai::pipelines::llm_engine::LLMEngine;
 use crate::openai::pipelines::pipeline::DefaultLoader;
-use crate::openai::requests::{
-    extract_text_from_content, extract_text_from_required_content, Messages,
-};
+use crate::openai::requests::Messages;
 use crate::openai::resolve_tools_for_request;
 use crate::openai::sampling_params::{GenerationConfig, SamplingParams};
+use crate::openai::PipelineConfig;
 use crate::scheduler::cache_engine::{CacheConfig, CacheEngine};
 use crate::scheduler::prefix_cache::PrefixCacheConfig;
 use crate::scheduler::SchedulerConfig;
@@ -42,6 +42,7 @@ pub struct EngineBuilder {
     max_num_seqs: usize,
     block_size: usize,
     kvcache_mem_gpu: usize,
+    gpu_memory_fraction: Option<f32>,
     kvcache_mem_cpu: usize,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -50,6 +51,7 @@ pub struct EngineBuilder {
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
     prefill_chunk_size: Option<usize>,
+    yarn_scaling_factor: Option<f64>,
 }
 
 impl EngineBuilder {
@@ -62,8 +64,9 @@ impl EngineBuilder {
             fp8_kvcache: None,
             device_ids: None,
             max_num_seqs: 16,
-            block_size: 64,
+            block_size: if cfg!(feature = "cuda") { 64 } else { 32 },
             kvcache_mem_gpu: 4096,
+            gpu_memory_fraction: Some(0.7),
             kvcache_mem_cpu: 128,
             temperature: None,
             top_p: None,
@@ -72,6 +75,7 @@ impl EngineBuilder {
             frequency_penalty: None,
             presence_penalty: None,
             prefill_chunk_size: None,
+            yarn_scaling_factor: None,
         }
     }
 
@@ -115,6 +119,11 @@ impl EngineBuilder {
         self
     }
 
+    pub fn with_gpu_memory_fraction(mut self, gpu_memory_fraction: f32) -> Self {
+        self.gpu_memory_fraction = Some(gpu_memory_fraction);
+        self
+    }
+
     pub fn with_kvcache_mem_cpu(mut self, kvcache_mem_cpu: usize) -> Self {
         self.kvcache_mem_cpu = kvcache_mem_cpu;
         self
@@ -149,6 +158,11 @@ impl EngineBuilder {
         self
     }
 
+    pub fn with_yarn_scaling_factor(mut self, factor: f64) -> Self {
+        self.yarn_scaling_factor = Some(factor);
+        self
+    }
+
     pub async fn build_async(self) -> Result<Engine> {
         let (model_id, weight_path, weight_file) = match self.repo {
             ModelRepo::ModelID((model_id, filename)) => (
@@ -168,7 +182,7 @@ impl EngineBuilder {
             weight_path.clone(),
             weight_file.clone(),
             None,
-            None,
+            self.yarn_scaling_factor,
         ));
 
         // Use cached token if available, or try to load safely without prompt (api mode should not block on stdin)
@@ -211,6 +225,38 @@ impl EngineBuilder {
         let mut cache_config: Option<CacheConfig> = None;
 
         let num_shards = device_ids.len();
+        let first_pipeline = pipelines
+            .first()
+            .expect("at least one pipeline must be loaded");
+        let first_config = first_pipeline.get_model_config();
+        let first_model_dtype = first_pipeline.dtype;
+        let devices: Vec<_> = pipelines.iter().map(|pipeline| pipeline.device()).collect();
+        let (kvcache_mem_gpu, mamba_cache_budget_bytes) = match self.gpu_memory_fraction {
+            Some(gpu_memory_fraction) => {
+                let detected =
+                    crate::detect_kvcache_mem_gpu_mb_for_devices(&devices, gpu_memory_fraction)?;
+                let mut effective_kvcache_mem_gpu = detected;
+                let mut mamba_cache_budget_bytes = 0usize;
+                if let Some(estimate) =
+                    crate::estimate_hybrid_mamba_cache(&first_config, first_model_dtype, num_shards)
+                {
+                    if let Some(plan) = crate::plan_hybrid_mamba_cache(
+                        detected * 1024 * 1024,
+                        estimate,
+                        self.max_num_seqs.max(16),
+                        false,
+                    ) {
+                        let reserved_mamba_mb = plan.budget_bytes.div_ceil(1024 * 1024);
+                        if reserved_mamba_mb < detected {
+                            effective_kvcache_mem_gpu = detected - reserved_mamba_mb;
+                            mamba_cache_budget_bytes = plan.budget_bytes;
+                        }
+                    }
+                }
+                (effective_kvcache_mem_gpu, mamba_cache_budget_bytes)
+            }
+            None => (self.kvcache_mem_gpu, 0),
+        };
 
         let pipelines: HashMap<
             usize,
@@ -223,14 +269,15 @@ impl EngineBuilder {
             .enumerate()
             .map(|(rank, pipeline)| {
                 let cfg = pipeline.get_model_config();
-                let cache_cfg = crate::get_cache_config(
-                    self.kvcache_mem_gpu,
+                let mut cache_cfg = crate::get_cache_config(
+                    kvcache_mem_gpu,
                     self.kvcache_mem_cpu,
                     self.block_size,
                     &cfg,
                     kv_cache_dtype,
                     num_shards,
                 );
+                cache_cfg.mamba_cache_budget_bytes = mamba_cache_budget_bytes;
 
                 let cache_engine = CacheEngine::new(
                     &cfg,
@@ -262,7 +309,7 @@ impl EngineBuilder {
 
         let notify = Arc::new(Notify::new());
         // holding_time logic
-        let holding_time = 500; // Default
+        let holding_time = 100; // Default
 
         let engine = LLMEngine::new(
             pipelines,
@@ -278,22 +325,25 @@ impl EngineBuilder {
             self.prefill_chunk_size,
         )?;
 
+        let mut pipeline_config = PipelineConfig {
+            max_model_len: config.max_seq_len,
+            default_max_tokens: config.max_seq_len / 5, // Approximate default
+            generation_cfg: Some(GenerationConfig {
+                temperature: self.temperature,
+                top_k: self.top_k,
+                top_p: self.top_p,
+                min_p: self.min_p,
+                frequency_penalty: self.frequency_penalty,
+                presence_penalty: self.presence_penalty,
+            }),
+        };
+        pipeline_config.apply_kv_cache_limit(&cache_config);
+
         // Return the Engine wrapper
         Ok(Engine {
             engine,
             notify,
-            pipeline_config: crate::openai::PipelineConfig {
-                max_model_len: config.max_seq_len,
-                default_max_tokens: config.max_seq_len / 5, // Approximate default
-                generation_cfg: Some(GenerationConfig {
-                    temperature: self.temperature,
-                    top_k: self.top_k,
-                    top_p: self.top_p,
-                    min_p: self.min_p,
-                    frequency_penalty: self.frequency_penalty,
-                    presence_penalty: self.presence_penalty,
-                }),
-            },
+            pipeline_config,
             _runtime: None,
         })
     }
@@ -388,9 +438,15 @@ impl Engine {
 
     pub async fn generate_request(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
-        let (prompt, tokenizer) = {
+        if let Messages::Chat(messages) = &mut request.messages {
+            crate::openai::requests::normalize_empty_openai_tool_results(messages);
+            crate::openai::requests::validate_openai_tool_messages(messages)
+                .map_err(candle_core::Error::wrap)?;
+        }
+
+        let (prompt, tokenizer, image_data) = {
             let e = self.engine.read();
             let (pipeline, _) = e.get_pipeline(0).unwrap();
 
@@ -399,6 +455,7 @@ impl Engine {
 
             // tokenizer is inside DefaultPipeline
             let mut conversation = pipeline.conversation.clone();
+            let mut image_data = None;
 
             // Logic to get prompt from messages
             // We need to access `messages` from request.
@@ -407,35 +464,15 @@ impl Engine {
                     conversation.append_message("user".to_string(), msg.clone());
                 }
                 Messages::Chat(messages) => {
-                    for message in messages {
-                        let role = message.role.as_str();
-                        if role == "system" {
-                            if let Some(content) = &message.content {
-                                let text = extract_text_from_required_content(content);
-                                if !text.is_empty() {
-                                    conversation.set_system_message(Some(text));
-                                }
-                            }
-                            continue;
-                        }
-
-                        if role == "tool" {
-                            let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
-                            let content = extract_text_from_content(message.content.as_ref());
-                            let trimmed = content.trim();
-                            if !trimmed.is_empty() {
-                                let prompt =
-                                    format!("[Tool Result for {}]: {}", tool_call_id, trimmed);
-                                conversation.append_message(role.to_string(), prompt);
-                            }
-                            continue;
-                        }
-
-                        if let Some(content) = &message.content {
-                            let text = extract_text_from_required_content(content);
-                            if !text.is_empty() {
-                                conversation.append_message(role.to_string(), text);
-                            }
+                    let (render_messages, images) =
+                        build_messages_and_images(messages, pipeline.image_config.as_ref())
+                            .map_err(candle_core::Error::wrap)?;
+                    image_data = images;
+                    for message in render_messages {
+                        if message.role == "system" {
+                            conversation.set_system_message(Some(message.content.clone()));
+                        } else {
+                            conversation.append_template_message(message);
                         }
                     }
                 }
@@ -446,15 +483,29 @@ impl Engine {
                         {
                             if role == "system" {
                                 conversation.set_system_message(Some(content.clone()));
+                            } else {
+                                use crate::openai::conversation::Message;
+                                conversation.append_template_message(Message {
+                                    role: role.to_string(),
+                                    content: content.clone(),
+                                    num_images: 0,
+                                    reasoning_content: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                });
                             }
-                            conversation.append_message(role.to_string(), content.clone());
                         }
                     }
                 }
             };
 
             if !tool_config.tools.is_empty() {
-                let mut tools_prompt = ToolFormat::get_tool_prompt(&pipeline.tool_config);
+                let mut tools_prompt = ToolFormat::get_tool_prompt(
+                    &pipeline.tool_config,
+                    &pipeline.tool_model_type,
+                    &pipeline.tool_parser_model_id,
+                    pipeline.enforce_parser.as_deref(),
+                );
 
                 // Enforce tool_choice=function
                 if let crate::openai::ToolChoiceKind::Function(name) = &tool_config.choice {
@@ -473,9 +524,10 @@ impl Engine {
                 conversation.set_system_message(Some(new_system));
             }
 
-            let prompt =
-                conversation.get_prompt(request.thinking.unwrap_or(false), &tool_config.tools);
-            (prompt, pipeline.tokenizer.clone())
+            let enable_thinking = request.thinking.unwrap_or(true);
+            let prompt = conversation.get_prompt(enable_thinking, &tool_config.tools);
+
+            (prompt, pipeline.tokenizer.clone(), image_data)
         };
 
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -498,42 +550,53 @@ impl Engine {
         let req_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // Re-add request with req_notify
+        let prefilled_reasoning_end =
+            crate::tools::stream_parser::detect_prefilled_reasoning_end_marker(&prompt);
+
+        let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
         {
             let mut e = self.engine.write();
+            let mut sampling_params = SamplingParams::new(
+                request.n.unwrap_or(1),
+                request.best_of,
+                request.presence_penalty.unwrap_or(0.0),
+                request.frequency_penalty.unwrap_or(0.0),
+                request.repeat_last_n,
+                request.temperature,
+                request.top_p,
+                request.min_p,
+                request.top_k,
+                request.use_beam_search.unwrap_or(false),
+                1.0,
+                crate::openai::sampling_params::EarlyStoppingCondition::UnlikelyBetterCandidates,
+                request.stop.clone(),
+                request.stop_token_ids.clone().unwrap_or_default(),
+                request.ignore_eos.unwrap_or(false),
+                request.max_tokens.unwrap_or(16),
+                None,
+                None,
+                request.skip_special_tokens.unwrap_or(true),
+                request.thinking,
+            )
+            .map_err(candle_core::Error::msg)?;
+            sampling_params.mcp_mode = if has_tools { Some(true) } else { None };
             e.add_request(
                 token_ids,
                 request_id.clone(),
                 std::time::SystemTime::now(),
-                 SamplingParams::new(
-                    request.n.unwrap_or(1),
-                    request.best_of,
-                    request.presence_penalty.unwrap_or(0.0),
-                    request.frequency_penalty.unwrap_or(0.0),
-                    request.repeat_last_n,
-                    request.temperature,
-                    request.top_p,
-                    request.min_p,
-                    request.top_k,
-                    request.use_beam_search.unwrap_or(false),
-                    1.0,
-                    crate::openai::sampling_params::EarlyStoppingCondition::UnlikelyBetterCandidates,
-                    request.stop.clone(),
-                    request.stop_token_ids.clone().unwrap_or_default(),
-                    request.ignore_eos.unwrap_or(false),
-                    request.max_tokens.unwrap_or(16),
-                    None,
-                    None,
-                    request.skip_special_tokens.unwrap_or(true),
-                    request.thinking,
-                ).map_err(candle_core::Error::msg)?,
+                sampling_params,
                 request.logprobs.unwrap_or(false),
                 false, // is_embedding
                 crate::openai::requests::EncodingFormat::default(),
                 crate::openai::requests::EmbeddingType::default(),
-                None,
-                None,
+                request.tools.clone().unwrap_or_default(),
+                image_data,
                 None, // streamer
-                Some(req_notify.clone()), // Use the local notify
+                Some(req_notify.clone()),
+                false,
+                prefilled_reasoning_end,
+                None,
+                None,
             );
             self.notify.notify_one();
         }
@@ -549,12 +612,36 @@ impl Engine {
         }
 
         let e = self.engine.read();
+        let response_model = e
+            .get_pipeline(0)
+            .map(|(pipeline, _)| pipeline.name().to_string())
+            .unwrap_or_else(|| request.model.clone().unwrap_or("default".to_string()));
         if let Some(record) = e.completion_records.get(&request_id) {
+            let mut choices = record.0.clone();
+            if crate::stream_as_reasoning_content() && has_tools {
+                for choice in &mut choices {
+                    if let Some(text) = choice.message.content.take() {
+                        match crate::tools::stream_parser::extract_reasoning_content(&text) {
+                            Some((reasoning, remaining)) => {
+                                choice.message.content = if remaining.is_empty() {
+                                    None
+                                } else {
+                                    Some(remaining)
+                                };
+                                choice.message.reasoning_content = Some(reasoning);
+                            }
+                            None => {
+                                choice.message.content = Some(text);
+                            }
+                        }
+                    }
+                }
+            }
             Ok(ChatCompletionResponse {
                 id: request_id,
-                choices: record.0.clone(),
+                choices,
                 created: record.1.created,
-                model: request.model.clone().unwrap_or("default".to_string()),
+                model: response_model,
                 object: "chat.completion",
                 usage: record.1.clone(),
             })
@@ -619,7 +706,6 @@ impl Engine {
                 prompt_tokens,
                 request_id.clone(),
                  std::time::SystemTime::now(),
-                 // Dummy sampling params
                  SamplingParams::new(
                     1, None, 0.0, 0.0, None, None, None, None, None, false, 1.0,
                     crate::openai::sampling_params::EarlyStoppingCondition::UnlikelyBetterCandidates,
@@ -629,9 +715,13 @@ impl Engine {
                 true, // is_embedding
                 request.encoding_format.clone(),
                 request.embedding_type.clone(),
-                None,
+                Vec::new(),
                 None,
                 Some(std::sync::Arc::new(tx)),
+                None,
+                false,
+                None,
+                None,
                 None,
             );
             self.notify.notify_one();

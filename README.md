@@ -7,8 +7,6 @@
   <a href="./README-CN.md">简体中文</a> |
 </p>
 
-[![Continuous integration](https://github.com/EricLBuehler/candle-vllm/actions/workflows/ci.yml/badge.svg)](https://github.com/EricLBuehler/candle-vllm/actions/workflows/ci.yml)
-
 Efficient, easy-to-use platform for inference and serving local LLMs including an OpenAI compatible API server.
 
 ## Features
@@ -29,6 +27,7 @@ Efficient, easy-to-use platform for inference and serving local LLMs including a
 - Support Block-wise FP8 Models (SM90+, Qwen3 Series)
 - Support Flashinfer Backend
 - Support manual YaRN RoPE scaling override from the command line via `--yarn-scaling-factor`
+- Support MXFP4/NVFP4 models
 
 ## Supported Models
 - Currently, candle-vllm supports chat serving for the following model structures.
@@ -51,6 +50,9 @@ Efficient, easy-to-use platform for inference and serving local LLMs including a
     | #12 | **DeepSeek V2/V3/R1** |TBD|~20 tks **(AWQ 671B, tp=8, offloading)**|
     | #13 | **QwQ-32B** |45 tks/s **(32B, tp=2)**|63 tks/s **(32B, Q4K)**|
     | #14 | **GLM4** |89 tks/s **(9B)**|124 tks/s **(9B, Q4K)**|
+    | #15 | **GLM4.7 Flash** |TBD|75 tks/s **(31B, NVFP4)**|
+    | #16 | **LLama4** |TBD|43 tks/s **(107B, NVFP4)**|
+    | #17 | **Gemma4-26B** |75 tks/s|72 tks/s **(NVFP4)**|
   </details>
 
 ### Demo Video
@@ -154,7 +156,15 @@ cargo install --features metal --path .
     where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--isq q4k`: convert weights into `q4k` format during model loading; `--prefill-chunk-size` chunk the prefill into size defined in this flag (default 8K, `0` for disable); `--frequency-penalty` and `--presence-penalty` repetition penalty (value from -2.0 to 2.0); `--mem` (`kvcache-mem-gpu`) sets a fixed KV cache budget in MB; `--gpu-memory-fraction` auto-sizes KV cache after model load using `fraction * remaining_gpu_memory`; `--enforce-parser` forces a specific tool parser backend such as `qwen_coder`, `qwen`, `json`, or `mistral`; `--yarn-scaling-factor` manually injects a YaRN RoPE scaling factor such as `4.0` to extend the effective context window for supported models; `--fp8-kvcache` used to enable fp8 kvcache; `--prefix-cache` enable prefix cache reuse; `--prefix-cache-max-tokens` cap prefix cache size; `--ui-server` start with a built-in ChatGPT-like Web UI sever. Replace `flashinfer` in `BUILD_PARAM` with `flashattn` to use the Flash attention backend instead.
   </details>
 
-
+## 📚 Docs
+- [Rust Crate Usage](docs/rust_crate.md)
+- [Embedding Model Usage](docs/embedding.md)
+- [MCP & Tool Calling](docs/mcp_tool_calling.md)
+- [Tool Call Parsing](docs/tool_parsing.md)
+- [Prefix Cache](docs/prefix_cache.md)
+- [Multimodal Model Usage](docs/multimodal.md)
+- [Work with OpenCode](docs/opencode.md)
+- [Work with Kilo Code](docs/kilocode.md)
 
 ## How to serve models?
 
@@ -164,7 +174,7 @@ cargo install --features metal --path .
 docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data candle-vllm:latest bash
 ```
 
-- Run **Uncompressed** models 
+- Run **Uncompressed, FP8 or FP4** models 
   <details open>
     <summary>Show command</summary>
 
@@ -197,6 +207,15 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
     ```shell
      # MacOS/Metal (Dense)
     candle-vllm --m Qwen/Qwen3-4B-Instruct-2507-FP8 --ui-server --prefix-cache
+    ```
+
+    **FP4 Model** (MXFP4/NVFP4, MLX quantized format not supported)
+    ```shell
+    candle-vllm --m GadflyII-GLM-4.7-Flash-NVFP4 --ui-server --prefix-cache
+    ```
+
+    ```shell
+    candle-vllm --m nm-testing/Qwen3-30B-A3B-MXFP4A16 --ui-server --prefix-cache
     ```
   </details>
 
@@ -421,13 +440,6 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
 
     Note: The exact NUMA binding sequence may vary depending on your hardware configuration.
   </details>
-
-## 📚 Additional Docs
-- [Rust Crate Usage](docs/rust_crate.md)
-- [Embedding Model Usage](docs/embedding.md)
-- [MCP & Tool Calling](docs/mcp_tool_calling.md)
-- [Prefix Cache](docs/prefix_cache.md)
-- [Work with OpenCode](docs/opencode.md)
 
 ## How to send request(s) to the backend?
 

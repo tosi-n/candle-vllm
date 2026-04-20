@@ -268,7 +268,12 @@ async fn build_prompt(
     }
 
     if !tool_config.tools.is_empty() {
-        let mut tools_prompt = ToolFormat::get_tool_prompt(&pipeline.0.tool_config);
+        let mut tools_prompt = ToolFormat::get_tool_prompt(
+            &pipeline.0.tool_config,
+            &pipeline.0.tool_model_type,
+            &pipeline.0.tool_parser_model_id,
+            pipeline.0.enforce_parser.as_deref(),
+        );
         if let ToolChoiceKind::Function(name) = &tool_config.choice {
             tools_prompt = format!(
                 "IMPORTANT: You MUST call the tool \"{}\". Do not respond with plain text.\n\n{}",
@@ -619,12 +624,14 @@ impl EmbeddedCandleVllmHost {
                     content: Some(MessageContentType::PureText(String::new())),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContentType::PureText(trimmed.to_string())),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ]),
             thinking: Some(false),
@@ -644,8 +651,7 @@ impl EmbeddedCandleVllmHost {
             .map_err(|error| candle_core::Error::msg(error.to_string()))?;
         info!(
             prompt_tokens = prompt_ids.len(),
-            max_hidden_states,
-            "embedded runtime prepared prompt ids for adapter capture"
+            max_hidden_states, "embedded runtime prepared prompt ids for adapter capture"
         );
 
         let hidden_states = {
@@ -661,12 +667,15 @@ impl EmbeddedCandleVllmHost {
                 (prompt_len,),
                 device,
             )?;
-            let slot_mapping =
-                Tensor::from_vec((0..prompt_len as i64).collect::<Vec<_>>(), (prompt_len,), device)?;
-            let cu_seqlens =
-                Tensor::from_vec(vec![0u32, prompt_len as u32], (2,), device)?;
+            let slot_mapping = Tensor::from_vec(
+                (0..prompt_len as i64).collect::<Vec<_>>(),
+                (prompt_len,),
+                device,
+            )?;
+            let cu_seqlens = Tensor::from_vec(vec![0u32, prompt_len as u32], (2,), device)?;
             let input_metadata = crate::InputMetadata {
                 is_prefill: true,
+                is_mla: false,
                 sequence_ids: None,
                 mamba_slot_mapping: None,
                 slot_mapping,
@@ -683,12 +692,14 @@ impl EmbeddedCandleVllmHost {
             };
             info!(
                 prompt_len,
-                max_hidden_states,
-                "embedded runtime invoking forward_internalize_states"
+                max_hidden_states, "embedded runtime invoking forward_internalize_states"
             );
-            pipeline
-                .0
-                .forward_internalize_states(tokens, &positions, &input_metadata, max_hidden_states)?
+            pipeline.0.forward_internalize_states(
+                tokens,
+                &positions,
+                &input_metadata,
+                max_hidden_states,
+            )?
         };
         info!(
             hidden_states = hidden_states.len(),
@@ -1024,14 +1035,18 @@ impl EmbeddedCandleVllmHost {
                     false,
                     EncodingFormat::default(),
                     EmbeddingType::default(),
-                    adapter_for_engine,
-                    timeline_for_engine,
+                    tool_config.tools.clone(),
+                    None,
                     if stream_request {
                         Some(Arc::new(response_tx))
                     } else {
                         None
                     },
                     sync_completion_notify,
+                    false,
+                    None,
+                    adapter_for_engine,
+                    timeline_for_engine,
                 );
                 model.notify.notify_one();
             });

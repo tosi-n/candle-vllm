@@ -14,7 +14,6 @@ use std::iter::zip;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::info;
 
 impl Qwen {
     fn load_raw_config(filename: &PathBuf) -> Result<Config> {
@@ -260,11 +259,6 @@ impl Qwen {
         input_metadata: &InputMetadata,
         max_hidden_states: usize,
     ) -> Result<Vec<Tensor>> {
-        info!(
-            max_hidden_states,
-            input_len = input_ids.dims1()?,
-            "qwen forward_internalize_states starting"
-        );
         let seqlens = if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
                 .cu_seqlens_q
@@ -288,7 +282,7 @@ impl Qwen {
         hidden_states.push(xs.clone());
 
         let layers_to_run = max_hidden_states.saturating_sub(1).min(self.layers.len());
-        for (idx, layer) in self.layers.iter().take(layers_to_run).enumerate() {
+        for layer in self.layers.iter().take(layers_to_run) {
             xs = layer.forward(
                 &xs,
                 attention_mask.as_ref(),
@@ -297,19 +291,8 @@ impl Qwen {
                 input_metadata,
             )?;
             hidden_states.push(xs.clone());
-            if idx == 0 || idx + 1 == layers_to_run || (idx + 1) % 8 == 0 {
-                info!(
-                    completed_layers = idx + 1,
-                    total_layers = layers_to_run,
-                    "qwen forward_internalize_states progressed"
-                );
-            }
         }
 
-        info!(
-            hidden_states = hidden_states.len(),
-            "qwen forward_internalize_states completed"
-        );
         Ok(hidden_states)
     }
 

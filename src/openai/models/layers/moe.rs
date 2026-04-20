@@ -1,6 +1,7 @@
+use crate::backend::custom_ops::moe::TopKLastDimOp;
 use crate::candle::quantized::QTensor;
 use crate::openai::distributed::{shard, AllReduce, Comm, VarBuilder};
-use crate::openai::models::linear::{linear_no_bias, Linear};
+use crate::openai::models::linear::{linear_no_bias, linear_no_bias_x, Linear, LinearX};
 use crate::openai::models::{Config, MoEConfig, QuantConfig, QwenMoEConfig};
 use attention_rs::moe;
 use attention_rs::moe::moe_gemm_fp8;
@@ -8,6 +9,7 @@ use candle::{DType, Module, Result, Tensor, D};
 use candle_core as candle;
 use candle_core::quantized::GgmlDType;
 use candle_nn::var_builder::Shard;
+
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug)]
@@ -45,13 +47,15 @@ fn arch_name(cfg: &Config) -> &str {
 fn resolve_packed_gate_up_layout(cfg: &Config) -> Result<PackedGateUpLayout> {
     let arch = arch_name(cfg);
 
-    // Qwen3.5 MoE / Qwen3-Next checkpoints store gate_up as [experts, 2*intermediate, hidden].
+    // Qwen3.5 MoE / Qwen3-Next / Gemma4 checkpoints store gate_up as [experts, 2*intermediate, hidden].
     if matches!(
         arch,
         "Qwen3_5MoeForCausalLM"
             | "Qwen3_5MoeForConditionalGeneration"
             | "Qwen3NextForCausalLM"
             | "Qwen3NextForConditionalGeneration"
+            | "Gemma4ForConditionalGeneration"
+            | "Gemma4ForCausalLM"
     ) {
         return Ok(PackedGateUpLayout::InterPacked);
     }
@@ -72,13 +76,15 @@ fn resolve_packed_gate_up_layout(cfg: &Config) -> Result<PackedGateUpLayout> {
 fn resolve_packed_down_layout(cfg: &Config) -> PackedDownLayout {
     let arch = arch_name(cfg);
 
-    // Qwen3.5 MoE / Qwen3-Next checkpoints store down_proj as [experts, hidden, intermediate].
+    // Qwen3.5 MoE / Qwen3-Next / Gemma4 checkpoints store down_proj as [experts, hidden, intermediate].
     if matches!(
         arch,
         "Qwen3_5MoeForCausalLM"
             | "Qwen3_5MoeForConditionalGeneration"
             | "Qwen3NextForCausalLM"
             | "Qwen3NextForConditionalGeneration"
+            | "Gemma4ForConditionalGeneration"
+            | "Gemma4ForCausalLM"
     ) {
         PackedDownLayout::HiddenInter
     } else {
@@ -304,8 +310,42 @@ impl FusedMoe {
         })
     }
 
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilder,
+        experts_vb: VarBuilder,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let gate = linear_no_bias(cfg.hidden_size, num_experts, gate_vb, Shard::default())?;
+
+        let (gate_w, up_w, down_w) = load_packed_experts(cfg, experts_vb, comm.clone())?;
+        let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 1)?;
+        let world_size = comm.world_size();
+        let w_size_n = gate_up_w.dim(1)? / 2;
+
+        Ok(Self {
+            gate,
+            gate_up_w,
+            w_size_n,
+            down_w,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm),
+            world_size,
+            dtype,
+        })
+    }
+
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
-        let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
         let (mut topk_weights, topk_ids) = attention_rs::topk::topk_softmax(
@@ -320,6 +360,18 @@ impl FusedMoe {
         if let Some(routed_scaling_factor) = self.routed_scaling_factor {
             topk_weights = (topk_weights * routed_scaling_factor)?;
         }
+
+        self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
 
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
@@ -597,15 +649,14 @@ impl FusedMoeISQ {
     }
 
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
-        let (num_tokens, hidden_dim) = xs.dims2()?;
         let original_dtype = xs.dtype();
-        let xs = if xs.dtype() != DType::F32 {
+        let xs_f32 = if xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)?
         } else {
             xs.to_owned()
         };
 
-        let router_logits = self.gate.forward(&xs)?;
+        let router_logits = self.gate.forward(&xs_f32)?;
 
         let (mut topk_weights, topk_ids) =
             attention_rs::topk::topk_softmax(&router_logits, self.num_experts_per_tok)?;
@@ -616,6 +667,28 @@ impl FusedMoeISQ {
         if let Some(routed_scaling_factor) = self.routed_scaling_factor {
             topk_weights = (topk_weights * routed_scaling_factor)?;
         }
+
+        let mut ys = self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)?;
+        if ys.dtype() != original_dtype {
+            ys = ys.to_dtype(original_dtype)?;
+        }
+        Ok(ys)
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+        let xs = if xs.dtype() != DType::F32 {
+            xs.to_dtype(DType::F32)?
+        } else {
+            xs.to_owned()
+        };
+
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
             {
@@ -668,7 +741,66 @@ impl FusedMoeISQ {
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;
         }
-        ys.to_dtype(original_dtype)
+        Ok(ys)
+    }
+
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilder,
+        experts_vb: VarBuilder,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let mut quant_type = match cfg.isq_quant.as_ref().unwrap().as_str() {
+            "q40" | "q4_0" => GgmlDType::Q4_0,
+            "q4" | "q41" | "q4_1" => GgmlDType::Q4_1,
+            "q50" | "q5_0" => GgmlDType::Q5_0,
+            "q5" | "q51" | "q5_1" => GgmlDType::Q5_1,
+            "q8" | "q80" | "q8_0" => GgmlDType::Q8_0,
+            "q2k" | "q2_k" => GgmlDType::Q2K,
+            "q3k" | "q3_k" => GgmlDType::Q3K,
+            "q4k" | "q4_k" => GgmlDType::Q4K,
+            "q5k" | "q5_k" => GgmlDType::Q5K,
+            "q6k" | "q6_k" => GgmlDType::Q6K,
+            _ => panic!("Unsupported GGML data type!"),
+        };
+
+        let block_size = quant_type.block_size();
+        if comm.world_size() > 1
+            && moe_cfg.moe_intermediate_size / comm.world_size() % block_size != 0
+        {
+            quant_type = GgmlDType::Q8_0;
+        }
+
+        let gate = linear_no_bias(cfg.hidden_size, num_experts, gate_vb, Shard::default())?;
+
+        let (gate_experts, up_experts, down_experts) =
+            load_packed_experts(cfg, experts_vb, comm.clone())?;
+
+        let gate_experts = QTensor::quantize(&gate_experts, quant_type)?;
+        let up_experts = QTensor::quantize(&up_experts, quant_type)?;
+        let down_experts = QTensor::quantize(&down_experts, GgmlDType::Q8_0)?;
+        let world_size = comm.world_size();
+
+        Ok(Self {
+            gate,
+            gate_experts,
+            up_experts,
+            down_experts,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm),
+            world_size,
+            dtype,
+        })
     }
 }
 
@@ -931,8 +1063,147 @@ impl FusedMoeFp8 {
         })
     }
 
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilder,
+        experts_vb: VarBuilder,
+        comm: Rc<Comm>,
+        dtype: DType,
+        quant_cfg: &QuantConfig,
+    ) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let block_size = quant_cfg
+            .weight_block_size
+            .clone()
+            .unwrap_or(vec![128, 128]);
+        if block_size.len() != 2 {
+            candle::bail!("FusedMoeFp8: weight_block_size must have 2 elements");
+        }
+        let by = block_size[0];
+        let bx = block_size[1];
+
+        let gate = linear_no_bias(cfg.hidden_size, num_experts, gate_vb, Shard::default())?;
+
+        let mut gate_experts = Vec::with_capacity(num_experts);
+        let mut gate_experts_scale = Vec::with_capacity(num_experts);
+        let mut up_experts = Vec::with_capacity(num_experts);
+        let mut up_experts_scale = Vec::with_capacity(num_experts);
+        let mut down_experts = Vec::with_capacity(num_experts);
+        let mut down_experts_scale = Vec::with_capacity(num_experts);
+
+        for i in 0..num_experts {
+            let expert_vb = experts_vb.pp(format!("{}", i).as_str());
+
+            let gate_weight = expert_vb.pp("gate_proj").get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size),
+                "weight",
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let sn = (moe_cfg.moe_intermediate_size + by - 1) / by;
+            let sk = (cfg.hidden_size + bx - 1) / bx;
+            let gate_s = match expert_vb.pp("gate_proj").get_with_hints_dtype(
+                (sn, sk),
+                "weight_scale",
+                shard(0, comm.rank(), comm.world_size()),
+                DType::F32,
+            ) {
+                Ok(s) => s,
+                Err(_) => expert_vb.pp("gate_proj").get_with_hints_dtype(
+                    (sn, sk),
+                    "weight_scale_inv",
+                    shard(0, comm.rank(), comm.world_size()),
+                    DType::F32,
+                )?,
+            };
+
+            let up_weight = expert_vb.pp("up_proj").get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size),
+                "weight",
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let up_s = match expert_vb.pp("up_proj").get_with_hints_dtype(
+                (sn, sk),
+                "weight_scale",
+                shard(0, comm.rank(), comm.world_size()),
+                DType::F32,
+            ) {
+                Ok(s) => s,
+                Err(_) => expert_vb.pp("up_proj").get_with_hints_dtype(
+                    (sn, sk),
+                    "weight_scale_inv",
+                    shard(0, comm.rank(), comm.world_size()),
+                    DType::F32,
+                )?,
+            };
+
+            let down_weight = expert_vb.pp("down_proj").get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                "weight",
+                shard(1, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let down_sn = (cfg.hidden_size + by - 1) / by;
+            let down_sk = (moe_cfg.moe_intermediate_size + bx - 1) / bx;
+            let down_s = match expert_vb.pp("down_proj").get_with_hints_dtype(
+                (down_sn, down_sk),
+                "weight_scale",
+                shard(1, comm.rank(), comm.world_size()),
+                DType::F32,
+            ) {
+                Ok(s) => s,
+                Err(_) => expert_vb.pp("down_proj").get_with_hints_dtype(
+                    (down_sn, down_sk),
+                    "weight_scale_inv",
+                    shard(1, comm.rank(), comm.world_size()),
+                    DType::F32,
+                )?,
+            };
+
+            gate_experts.push(gate_weight);
+            gate_experts_scale.push(gate_s);
+            up_experts.push(up_weight);
+            up_experts_scale.push(up_s);
+            down_experts.push(down_weight);
+            down_experts_scale.push(down_s);
+        }
+
+        let gate_experts = Tensor::stack(&gate_experts, 0)?;
+        let gate_experts_scale = Tensor::stack(&gate_experts_scale, 0)?;
+        let up_experts = Tensor::stack(&up_experts, 0)?;
+        let up_experts_scale = Tensor::stack(&up_experts_scale, 0)?;
+        let down_experts = Tensor::stack(&down_experts, 0)?;
+        let down_experts_scale = Tensor::stack(&down_experts_scale, 0)?;
+
+        let gate_up_experts = Tensor::cat(&[&gate_experts, &up_experts], 1)?;
+        let gate_up_experts_scale = Tensor::cat(&[&gate_experts_scale, &up_experts_scale], 1)?;
+        let w_size_n = gate_up_experts.dim(1)? / 2;
+
+        Ok(Self {
+            gate,
+            gate_up_experts,
+            gate_up_experts_scale,
+            w_size_n,
+            down_experts,
+            down_experts_scale,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm.clone()),
+            world_size: comm.world_size(),
+            dtype,
+            block_size: vec![by, bx],
+        })
+    }
+
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
-        let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
         let (mut topk_weights, topk_ids) = attention_rs::topk::topk_softmax(
@@ -946,6 +1217,18 @@ impl FusedMoeFp8 {
         if let Some(routed_scaling_factor) = self.routed_scaling_factor {
             topk_weights = (topk_weights * routed_scaling_factor)?;
         }
+
+        self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
 
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
@@ -1001,6 +1284,892 @@ impl FusedMoeFp8 {
         )?
         .reshape((num_tokens, (), hidden_dim))?
         .sum(D::Minus2)?;
+
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys.to_dtype(self.dtype)?)
+    }
+}
+
+pub struct FusedMoeMxfp4 {
+    gate: LinearX,
+    gate_up_blocks: Tensor,
+    gate_up_scales: Tensor,
+    down_blocks: Tensor,
+    down_scales: Tensor,
+    w_size_n: usize,
+    act: candle_nn::Activation,
+    norm_topk_prob: bool,
+    routed_scaling_factor: Option<f64>,
+    num_experts_per_tok: usize,
+    all_reduce: AllReduce,
+    world_size: usize,
+    dtype: DType,
+}
+
+impl FusedMoeMxfp4 {
+    fn mxfp4_tensor_name_packed(vb: &candle_nn::var_builder::ShardedVarBuilder) -> &'static str {
+        if vb.contains_tensor("weight_packed") {
+            "weight_packed"
+        } else {
+            "blocks"
+        }
+    }
+
+    fn mxfp4_tensor_name_scale(vb: &candle_nn::var_builder::ShardedVarBuilder) -> &'static str {
+        if vb.contains_tensor("weight_scale") {
+            "weight_scale"
+        } else {
+            "scales"
+        }
+    }
+
+    pub fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let quant_method = cfg
+            .quantization_config
+            .as_ref()
+            .map(|q| q.quant_method.clone());
+        let gate = linear_no_bias_x(
+            cfg.hidden_size,
+            num_experts,
+            vb.pp("gate"),
+            Shard::default(),
+            &quant_method,
+            &cfg.quantization_config,
+            dtype,
+            None,
+        )?;
+
+        let mut gate_blocks_vec = Vec::new();
+        let mut gate_scales_vec = Vec::new();
+        let mut up_blocks_vec = Vec::new();
+        let mut up_scales_vec = Vec::new();
+        let mut down_blocks_vec = Vec::new();
+        let mut down_scales_vec = Vec::new();
+
+        let experts_vb = vb.pp("experts");
+
+        for i in 0..num_experts {
+            let expert_vb = experts_vb.pp(i.to_string());
+
+            let gate_proj_vb = expert_vb.pp("gate_proj");
+            let packed_name = Self::mxfp4_tensor_name_packed(&gate_proj_vb);
+            let scale_name = Self::mxfp4_tensor_name_scale(&gate_proj_vb);
+
+            let gate_b = gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let gate_s = gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 32),
+                scale_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+
+            let up_proj_vb = expert_vb.pp("up_proj");
+            let packed_name = Self::mxfp4_tensor_name_packed(&up_proj_vb);
+            let scale_name = Self::mxfp4_tensor_name_scale(&up_proj_vb);
+
+            let up_b = up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let up_s = up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 32),
+                scale_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+
+            let down_proj_vb = expert_vb.pp("down_proj");
+            let packed_name = Self::mxfp4_tensor_name_packed(&down_proj_vb);
+            let scale_name = Self::mxfp4_tensor_name_scale(&down_proj_vb);
+
+            let down_b = down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 2),
+                packed_name,
+                shard(1, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let down_s = down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 32),
+                scale_name,
+                shard(1, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+
+            gate_blocks_vec.push(gate_b);
+            gate_scales_vec.push(gate_s);
+            up_blocks_vec.push(up_b);
+            up_scales_vec.push(up_s);
+            down_blocks_vec.push(down_b);
+            down_scales_vec.push(down_s);
+        }
+
+        let gate_blocks = Tensor::stack(&gate_blocks_vec, 0)?;
+        let gate_scales = Tensor::stack(&gate_scales_vec, 0)?;
+        let up_blocks = Tensor::stack(&up_blocks_vec, 0)?;
+        let up_scales = Tensor::stack(&up_scales_vec, 0)?;
+
+        let gate_up_blocks = Tensor::cat(&[&gate_blocks, &up_blocks], 1)?;
+        let gate_up_scales = Tensor::cat(&[&gate_scales, &up_scales], 1)?;
+        let w_size_n = gate_up_blocks.dim(1)? / 2;
+
+        let down_blocks = Tensor::stack(&down_blocks_vec, 0)?;
+        let down_scales = Tensor::stack(&down_scales_vec, 0)?;
+
+        Ok(Self {
+            gate,
+            gate_up_blocks,
+            gate_up_scales,
+            down_blocks,
+            down_scales,
+            w_size_n,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm.clone()),
+            world_size: comm.world_size(),
+            dtype,
+        })
+    }
+
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilder,
+        experts_vb: VarBuilder,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let gate = linear_no_bias_x(
+            cfg.hidden_size,
+            num_experts,
+            gate_vb,
+            Shard::default(),
+            &None,
+            &None,
+            dtype,
+            None,
+        )?;
+
+        let mut gate_blocks_vec = Vec::new();
+        let mut gate_scales_vec = Vec::new();
+        let mut up_blocks_vec = Vec::new();
+        let mut up_scales_vec = Vec::new();
+        let mut down_blocks_vec = Vec::new();
+        let mut down_scales_vec = Vec::new();
+
+        for i in 0..num_experts {
+            let expert_vb = experts_vb.pp(i.to_string());
+
+            let gate_proj_vb = expert_vb.pp("gate_proj");
+            let packed_name = Self::mxfp4_tensor_name_packed(&gate_proj_vb);
+            let scale_name = Self::mxfp4_tensor_name_scale(&gate_proj_vb);
+
+            let gate_b = gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let gate_s = gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 32),
+                scale_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+
+            let up_proj_vb = expert_vb.pp("up_proj");
+            let packed_name = Self::mxfp4_tensor_name_packed(&up_proj_vb);
+            let scale_name = Self::mxfp4_tensor_name_scale(&up_proj_vb);
+
+            let up_b = up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let up_s = up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 32),
+                scale_name,
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+
+            let down_proj_vb = expert_vb.pp("down_proj");
+            let packed_name = Self::mxfp4_tensor_name_packed(&down_proj_vb);
+            let scale_name = Self::mxfp4_tensor_name_scale(&down_proj_vb);
+
+            let down_b = down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 2),
+                packed_name,
+                shard(1, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+            let down_s = down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 32),
+                scale_name,
+                shard(1, comm.rank(), comm.world_size()),
+                DType::U8,
+            )?;
+
+            gate_blocks_vec.push(gate_b);
+            gate_scales_vec.push(gate_s);
+            up_blocks_vec.push(up_b);
+            up_scales_vec.push(up_s);
+            down_blocks_vec.push(down_b);
+            down_scales_vec.push(down_s);
+        }
+
+        let gate_blocks = Tensor::stack(&gate_blocks_vec, 0)?;
+        let gate_scales = Tensor::stack(&gate_scales_vec, 0)?;
+        let up_blocks = Tensor::stack(&up_blocks_vec, 0)?;
+        let up_scales = Tensor::stack(&up_scales_vec, 0)?;
+
+        let gate_up_blocks = Tensor::cat(&[&gate_blocks, &up_blocks], 1)?;
+        let gate_up_scales = Tensor::cat(&[&gate_scales, &up_scales], 1)?;
+        let w_size_n = gate_up_blocks.dim(1)? / 2;
+
+        let down_blocks = Tensor::stack(&down_blocks_vec, 0)?;
+        let down_scales = Tensor::stack(&down_scales_vec, 0)?;
+
+        Ok(Self {
+            gate,
+            gate_up_blocks,
+            gate_up_scales,
+            down_blocks,
+            down_scales,
+            w_size_n,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm.clone()),
+            world_size: comm.world_size(),
+            dtype,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        let router_logits = self.gate.forward(xs)?;
+
+        let (mut topk_weights, topk_ids) = attention_rs::topk::topk_softmax(
+            &router_logits.to_dtype(DType::F32)?,
+            self.num_experts_per_tok,
+        )?;
+
+        if self.norm_topk_prob {
+            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
+        }
+
+        if let Some(routed_scaling_factor) = self.routed_scaling_factor {
+            topk_weights = (topk_weights * routed_scaling_factor)?;
+        }
+
+        self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+
+        let xs = if xs.dtype() == DType::F32 {
+            xs.to_dtype(self.dtype)?
+        } else {
+            xs.clone()
+        };
+
+        let gate_up = moe::moe_gemm_mxfp4(
+            &xs,
+            &self.gate_up_blocks,
+            &self.gate_up_scales,
+            None,
+            &topk_ids,
+            is_prefill,
+        )?;
+
+        let gate = gate_up
+            .narrow(candle::D::Minus1, 0, self.w_size_n)?
+            .contiguous()?;
+        let up = gate_up
+            .narrow(candle::D::Minus1, self.w_size_n, self.w_size_n)?
+            .contiguous()?;
+        let down_inputs = (up * gate.apply(&self.act)?)?;
+
+        let down = moe::moe_gemm_mxfp4(
+            &down_inputs,
+            &self.down_blocks,
+            &self.down_scales,
+            None,
+            &topk_ids,
+            is_prefill,
+        )?;
+
+        let topk_weights = topk_weights.to_dtype(down.dtype())?;
+        let mut ys = down
+            .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
+            .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
+            .sum(1)?;
+
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys.to_dtype(self.dtype)?)
+    }
+}
+
+pub struct FusedMoeNvfp4 {
+    gate: LinearX,
+    gate_up_blocks: Tensor,
+    gate_up_scales: Tensor,
+    gate_up_global_scales: Tensor,
+    gate_up_input_scales: Tensor,
+    down_blocks: Tensor,
+    down_scales: Tensor,
+    down_global_scales: Tensor,
+    down_input_scales: Tensor,
+    w_size_n: usize,
+    act: candle_nn::Activation,
+    norm_topk_prob: bool,
+    routed_scaling_factor: Option<f64>,
+    num_experts_per_tok: usize,
+    all_reduce: AllReduce,
+    world_size: usize,
+    dtype: DType,
+    use_sigmoid_scoring: bool,
+    apply_router_weight_on_input: bool,
+}
+
+impl FusedMoeNvfp4 {
+    fn tensor_name_packed(vb: &candle_nn::var_builder::ShardedVarBuilder) -> &'static str {
+        if vb.contains_tensor("weight_packed") {
+            "weight_packed"
+        } else if vb.contains_tensor("weight") {
+            "weight"
+        } else {
+            "blocks"
+        }
+    }
+
+    fn tensor_name_scale(vb: &candle_nn::var_builder::ShardedVarBuilder) -> &'static str {
+        if vb.contains_tensor("weight_scale") {
+            "weight_scale"
+        } else {
+            "scales"
+        }
+    }
+
+    fn load_global_scale(vb: &candle_nn::var_builder::ShardedVarBuilder) -> f32 {
+        let no_shard = Shard::default();
+        if vb.contains_tensor("weight_global_scale") {
+            let raw = vb
+                .get_with_hints_dtype((1,), "weight_global_scale", no_shard, DType::F32)
+                .or_else(|_| {
+                    vb.get_with_hints_dtype((), "weight_global_scale", no_shard, DType::F32)
+                })
+                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .unwrap_or(1.0);
+            if raw != 0.0 {
+                1.0 / raw
+            } else {
+                1.0
+            }
+        } else if vb.contains_tensor("weight_scale_2") {
+            vb.get_with_hints_dtype((1,), "weight_scale_2", no_shard, DType::F32)
+                .or_else(|_| vb.get_with_hints_dtype((), "weight_scale_2", no_shard, DType::F32))
+                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    fn load_input_scale(vb: &candle_nn::var_builder::ShardedVarBuilder) -> f32 {
+        let no_shard = Shard::default();
+        if vb.contains_tensor("input_scale") {
+            vb.get_with_hints_dtype((1,), "input_scale", no_shard, DType::F32)
+                .or_else(|_| vb.get_with_hints_dtype((), "input_scale", no_shard, DType::F32))
+                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .unwrap_or(1.0)
+        } else if vb.contains_tensor("input_global_scale") {
+            let raw = vb
+                .get_with_hints_dtype((1,), "input_global_scale", no_shard, DType::F32)
+                .or_else(|_| {
+                    vb.get_with_hints_dtype((), "input_global_scale", no_shard, DType::F32)
+                })
+                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .unwrap_or(1.0);
+            if raw != 0.0 {
+                1.0 / raw
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        }
+    }
+
+    pub fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let quant_method = cfg
+            .quantization_config
+            .as_ref()
+            .map(|q| q.quant_method.clone());
+        let gate = linear_no_bias_x(
+            cfg.hidden_size,
+            num_experts,
+            vb.pp("gate"),
+            Shard::default(),
+            &quant_method,
+            &cfg.quantization_config,
+            dtype,
+            None,
+        )?;
+
+        let experts_vb = vb.pp("experts");
+
+        let mut gate_blocks_vec = Vec::new();
+        let mut gate_scales_vec = Vec::new();
+        let mut gate_gscales_vec: Vec<f32> = Vec::new();
+        let mut gate_iscales_vec: Vec<f32> = Vec::new();
+        let mut up_blocks_vec = Vec::new();
+        let mut up_scales_vec = Vec::new();
+        let mut up_gscales_vec: Vec<f32> = Vec::new();
+        let mut up_iscales_vec: Vec<f32> = Vec::new();
+        let mut down_blocks_vec = Vec::new();
+        let mut down_scales_vec = Vec::new();
+        let mut down_gscales_vec: Vec<f32> = Vec::new();
+        let mut down_iscales_vec: Vec<f32> = Vec::new();
+
+        for i in 0..num_experts {
+            let expert_vb = experts_vb.pp(i.to_string());
+
+            let gate_proj_vb = expert_vb.pp("gate_proj");
+            let packed_name = Self::tensor_name_packed(&gate_proj_vb);
+            let scale_name = Self::tensor_name_scale(&gate_proj_vb);
+            let sh0 = shard(0, comm.rank(), comm.world_size());
+
+            gate_blocks_vec.push(gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                sh0,
+                DType::U8,
+            )?);
+            gate_scales_vec.push(gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 16),
+                scale_name,
+                sh0,
+                DType::U8,
+            )?);
+            gate_gscales_vec.push(Self::load_global_scale(&gate_proj_vb));
+            gate_iscales_vec.push(Self::load_input_scale(&gate_proj_vb));
+
+            let up_proj_vb = expert_vb.pp("up_proj");
+            let packed_name = Self::tensor_name_packed(&up_proj_vb);
+            let scale_name = Self::tensor_name_scale(&up_proj_vb);
+
+            up_blocks_vec.push(up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                sh0,
+                DType::U8,
+            )?);
+            up_scales_vec.push(up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 16),
+                scale_name,
+                sh0,
+                DType::U8,
+            )?);
+            up_gscales_vec.push(Self::load_global_scale(&up_proj_vb));
+            up_iscales_vec.push(Self::load_input_scale(&up_proj_vb));
+
+            let down_proj_vb = expert_vb.pp("down_proj");
+            let packed_name = Self::tensor_name_packed(&down_proj_vb);
+            let scale_name = Self::tensor_name_scale(&down_proj_vb);
+            let sh1 = shard(1, comm.rank(), comm.world_size());
+
+            down_blocks_vec.push(down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 2),
+                packed_name,
+                sh1,
+                DType::U8,
+            )?);
+            down_scales_vec.push(down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 16),
+                scale_name,
+                sh1,
+                DType::U8,
+            )?);
+            down_gscales_vec.push(Self::load_global_scale(&down_proj_vb));
+            down_iscales_vec.push(Self::load_input_scale(&down_proj_vb));
+        }
+
+        let gate_blocks = Tensor::stack(&gate_blocks_vec, 0)?;
+        let gate_scales = Tensor::stack(&gate_scales_vec, 0)?;
+        let up_blocks = Tensor::stack(&up_blocks_vec, 0)?;
+        let up_scales = Tensor::stack(&up_scales_vec, 0)?;
+
+        let gate_up_blocks = Tensor::cat(&[&gate_blocks, &up_blocks], 1)?;
+        let gate_up_scales = Tensor::cat(&[&gate_scales, &up_scales], 1)?;
+        let w_size_n = gate_up_blocks.dim(1)? / 2;
+
+        let dev = gate_up_blocks.device();
+        let gate_up_gscales: Vec<f32> = gate_gscales_vec
+            .iter()
+            .zip(up_gscales_vec.iter())
+            .map(|(g, u)| {
+                if (g - u).abs() > f32::EPSILON {
+                    tracing::warn!(
+                        "NVFP4 MoE: gate/up global scales differ ({g} vs {u}), using gate scale"
+                    );
+                }
+                *g
+            })
+            .collect();
+        let gate_up_global_scales = Tensor::from_vec(gate_up_gscales, (num_experts,), dev)?;
+
+        let gate_up_iscales: Vec<f32> = gate_iscales_vec
+            .iter()
+            .zip(up_iscales_vec.iter())
+            .map(|(g, u)| {
+                if (g - u).abs() > f32::EPSILON {
+                    tracing::warn!(
+                        "NVFP4 MoE: gate/up input scales differ ({g} vs {u}), using gate scale"
+                    );
+                }
+                *g
+            })
+            .collect();
+        let gate_up_input_scales = Tensor::from_vec(gate_up_iscales, (num_experts,), dev)?;
+
+        let down_blocks = Tensor::stack(&down_blocks_vec, 0)?;
+        let down_scales = Tensor::stack(&down_scales_vec, 0)?;
+        let down_global_scales = Tensor::from_vec(down_gscales_vec, (num_experts,), dev)?;
+        let down_input_scales = Tensor::from_vec(down_iscales_vec, (num_experts,), dev)?;
+
+        Ok(Self {
+            gate,
+            gate_up_blocks,
+            gate_up_scales,
+            gate_up_global_scales,
+            gate_up_input_scales,
+            down_blocks,
+            down_scales,
+            down_global_scales,
+            down_input_scales,
+            w_size_n,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm.clone()),
+            world_size: comm.world_size(),
+            dtype,
+            use_sigmoid_scoring: false,
+            apply_router_weight_on_input: false,
+        })
+    }
+
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilder,
+        experts_vb: VarBuilder,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let gate = linear_no_bias_x(
+            cfg.hidden_size,
+            num_experts,
+            gate_vb,
+            Shard::default(),
+            &None,
+            &None,
+            dtype,
+            None,
+        )?;
+
+        let mut gate_blocks_vec = Vec::new();
+        let mut gate_scales_vec = Vec::new();
+        let mut gate_gscales_vec: Vec<f32> = Vec::new();
+        let mut gate_iscales_vec: Vec<f32> = Vec::new();
+        let mut up_blocks_vec = Vec::new();
+        let mut up_scales_vec = Vec::new();
+        let mut up_gscales_vec: Vec<f32> = Vec::new();
+        let mut up_iscales_vec: Vec<f32> = Vec::new();
+        let mut down_blocks_vec = Vec::new();
+        let mut down_scales_vec = Vec::new();
+        let mut down_gscales_vec: Vec<f32> = Vec::new();
+        let mut down_iscales_vec: Vec<f32> = Vec::new();
+
+        for i in 0..num_experts {
+            let expert_vb = experts_vb.pp(i.to_string());
+
+            let gate_proj_vb = expert_vb.pp("gate_proj");
+            let packed_name = Self::tensor_name_packed(&gate_proj_vb);
+            let scale_name = Self::tensor_name_scale(&gate_proj_vb);
+            let sh0 = shard(0, comm.rank(), comm.world_size());
+
+            gate_blocks_vec.push(gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                sh0,
+                DType::U8,
+            )?);
+            gate_scales_vec.push(gate_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 16),
+                scale_name,
+                sh0,
+                DType::U8,
+            )?);
+            gate_gscales_vec.push(Self::load_global_scale(&gate_proj_vb));
+            gate_iscales_vec.push(Self::load_input_scale(&gate_proj_vb));
+
+            let up_proj_vb = expert_vb.pp("up_proj");
+            let packed_name = Self::tensor_name_packed(&up_proj_vb);
+            let scale_name = Self::tensor_name_scale(&up_proj_vb);
+
+            up_blocks_vec.push(up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
+                packed_name,
+                sh0,
+                DType::U8,
+            )?);
+            up_scales_vec.push(up_proj_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / 16),
+                scale_name,
+                sh0,
+                DType::U8,
+            )?);
+            up_gscales_vec.push(Self::load_global_scale(&up_proj_vb));
+            up_iscales_vec.push(Self::load_input_scale(&up_proj_vb));
+
+            let down_proj_vb = expert_vb.pp("down_proj");
+            let packed_name = Self::tensor_name_packed(&down_proj_vb);
+            let scale_name = Self::tensor_name_scale(&down_proj_vb);
+            let sh1 = shard(1, comm.rank(), comm.world_size());
+
+            down_blocks_vec.push(down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 2),
+                packed_name,
+                sh1,
+                DType::U8,
+            )?);
+            down_scales_vec.push(down_proj_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / 16),
+                scale_name,
+                sh1,
+                DType::U8,
+            )?);
+            down_gscales_vec.push(Self::load_global_scale(&down_proj_vb));
+            down_iscales_vec.push(Self::load_input_scale(&down_proj_vb));
+        }
+
+        let gate_blocks = Tensor::stack(&gate_blocks_vec, 0)?;
+        let gate_scales = Tensor::stack(&gate_scales_vec, 0)?;
+        let up_blocks = Tensor::stack(&up_blocks_vec, 0)?;
+        let up_scales = Tensor::stack(&up_scales_vec, 0)?;
+
+        let gate_up_blocks = Tensor::cat(&[&gate_blocks, &up_blocks], 1)?;
+        let gate_up_scales = Tensor::cat(&[&gate_scales, &up_scales], 1)?;
+        let w_size_n = gate_up_blocks.dim(1)? / 2;
+
+        let dev = gate_up_blocks.device();
+        let gate_up_gscales: Vec<f32> = gate_gscales_vec
+            .iter()
+            .zip(up_gscales_vec.iter())
+            .map(|(g, u)| {
+                if (g - u).abs() > f32::EPSILON {
+                    tracing::warn!(
+                        "NVFP4 MoE: gate/up global scales differ ({g} vs {u}), using gate scale"
+                    );
+                }
+                *g
+            })
+            .collect();
+        let gate_up_global_scales = Tensor::from_vec(gate_up_gscales, (num_experts,), dev)?;
+
+        let gate_up_iscales: Vec<f32> = gate_iscales_vec
+            .iter()
+            .zip(up_iscales_vec.iter())
+            .map(|(g, u)| {
+                if (g - u).abs() > f32::EPSILON {
+                    tracing::warn!(
+                        "NVFP4 MoE: gate/up input scales differ ({g} vs {u}), using gate scale"
+                    );
+                }
+                *g
+            })
+            .collect();
+        let gate_up_input_scales = Tensor::from_vec(gate_up_iscales, (num_experts,), dev)?;
+
+        let down_blocks = Tensor::stack(&down_blocks_vec, 0)?;
+        let down_scales = Tensor::stack(&down_scales_vec, 0)?;
+        let down_global_scales = Tensor::from_vec(down_gscales_vec, (num_experts,), dev)?;
+        let down_input_scales = Tensor::from_vec(down_iscales_vec, (num_experts,), dev)?;
+
+        Ok(Self {
+            gate,
+            gate_up_blocks,
+            gate_up_scales,
+            gate_up_global_scales,
+            gate_up_input_scales,
+            down_blocks,
+            down_scales,
+            down_global_scales,
+            down_input_scales,
+            w_size_n,
+            act: candle_nn::Activation::Silu,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm.clone()),
+            world_size: comm.world_size(),
+            dtype,
+            use_sigmoid_scoring: false,
+            apply_router_weight_on_input: false,
+        })
+    }
+
+    pub fn set_sigmoid_routing(&mut self) {
+        self.use_sigmoid_scoring = true;
+    }
+
+    pub fn set_apply_router_weight_on_input(&mut self, v: bool) {
+        self.apply_router_weight_on_input = v;
+    }
+
+    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        let router_logits = self.gate.forward(xs)?;
+
+        let (mut topk_weights, topk_ids): (Tensor, Tensor) = if self.use_sigmoid_scoring {
+            let scores = candle_nn::ops::sigmoid(&router_logits.to_dtype(DType::F32)?)?;
+            let topk = scores.topk(self.num_experts_per_tok)?;
+            (topk.values, topk.indices.to_dtype(DType::U32)?)
+        } else {
+            attention_rs::topk::topk_softmax(
+                &router_logits.to_dtype(DType::F32)?,
+                self.num_experts_per_tok,
+            )?
+        };
+
+        if self.norm_topk_prob {
+            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
+        }
+
+        if let Some(routed_scaling_factor) = self.routed_scaling_factor {
+            topk_weights = (topk_weights * routed_scaling_factor)?;
+        }
+
+        self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+
+        let xs = if xs.dtype() == DType::F32 {
+            xs.to_dtype(self.dtype)?
+        } else {
+            xs.clone()
+        };
+
+        let xs = if self.apply_router_weight_on_input {
+            let w = topk_weights.to_dtype(xs.dtype())?;
+            xs.broadcast_mul(&w)?
+        } else {
+            xs
+        };
+
+        let pre_sorted = if is_prefill {
+            let flat = topk_ids.flatten_all()?.contiguous()?;
+            let (eids, tids) = flat.sort_last_dim(true)?;
+            Some((tids, eids))
+        } else {
+            None
+        };
+        let pre_sorted_refs = pre_sorted.as_ref().map(|(a, b)| (a, b));
+
+        let gate_up = moe::moe_gemm_nvfp4(
+            &xs,
+            &self.gate_up_blocks,
+            &self.gate_up_scales,
+            &self.gate_up_global_scales,
+            Some(&self.gate_up_input_scales),
+            None,
+            &topk_ids,
+            pre_sorted_refs,
+            is_prefill,
+        )?;
+
+        let gate = gate_up
+            .narrow(candle::D::Minus1, 0, self.w_size_n)?
+            .contiguous()?;
+        let up = gate_up
+            .narrow(candle::D::Minus1, self.w_size_n, self.w_size_n)?
+            .contiguous()?;
+        let down_inputs = (up * gate.apply(&self.act)?)?;
+
+        let down = moe::moe_gemm_nvfp4(
+            &down_inputs,
+            &self.down_blocks,
+            &self.down_scales,
+            &self.down_global_scales,
+            Some(&self.down_input_scales),
+            None,
+            &topk_ids,
+            pre_sorted_refs,
+            is_prefill,
+        )?;
+
+        let mut ys = if self.apply_router_weight_on_input {
+            down.reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
+                .sum(1)?
+        } else {
+            let topk_weights = topk_weights.to_dtype(down.dtype())?;
+            down.broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
+                .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
+                .sum(1)?
+        };
 
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;

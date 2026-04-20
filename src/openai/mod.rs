@@ -13,6 +13,7 @@ use tokenizers::{EncodeInput, Encoding, Tokenizer};
 pub mod communicator;
 pub mod distributed;
 pub mod embedded_runtime;
+pub mod logger;
 pub mod lora;
 pub mod requests;
 pub mod responses;
@@ -137,7 +138,11 @@ pub struct TaskData {
     pub tools: Vec<Tool>,
     pub images: Option<multimodal::ImageData>,
     pub include_usage: bool,
+    #[serde(default)]
+    pub prefilled_reasoning_end: Option<String>,
+    #[serde(default)]
     pub adapter_id: Option<String>,
+    #[serde(default)]
     pub adapter_schedule: Option<Vec<requests::AdapterScheduleStep>>,
 }
 
@@ -169,10 +174,9 @@ fn normalize_tool_choice(choice: &Option<ToolChoice>) -> ToolChoiceKind {
             ToolChoiceKind::Function(function.name.clone())
         }
         Some(ToolChoice::Mode(mode)) => match mode {
+            crate::tools::ToolChoiceMode::Auto => ToolChoiceKind::Auto,
             crate::tools::ToolChoiceMode::None => ToolChoiceKind::None,
-            crate::tools::ToolChoiceMode::Auto | crate::tools::ToolChoiceMode::Required => {
-                ToolChoiceKind::Auto
-            }
+            crate::tools::ToolChoiceMode::Required => ToolChoiceKind::Auto,
         },
     }
 }

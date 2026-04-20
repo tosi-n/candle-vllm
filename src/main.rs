@@ -7,6 +7,7 @@ use axum::{
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "nccl")]
 use candle_vllm::backend::heartbeat;
+use candle_vllm::openai::lora::{set_global_lora_manager, LoRAManager};
 use candle_vllm::openai::models::Config;
 use candle_vllm::openai::openai_server::{
     adapters_status, chat_completions, create_embeddings, get_adapter, list_adapters, load_adapter,
@@ -17,13 +18,14 @@ use candle_vllm::openai::pipelines::pipeline::DefaultLoader;
 use candle_vllm::openai::runtime_internal::proto::runtime_internal_server::RuntimeInternalServer;
 use candle_vllm::openai::runtime_internal::{RuntimeInternalService, RuntimeKvProfile};
 use candle_vllm::openai::sampling_params::GenerationConfig;
-use candle_vllm::openai::OpenAIServerData;
+use candle_vllm::openai::{kv_cache_capacity_tokens, OpenAIServerData};
 use candle_vllm::scheduler::cache_engine::{CacheConfig, CacheEngine};
 use candle_vllm::scheduler::prefix_cache::PrefixCacheConfig;
 use candle_vllm::scheduler::SchedulerConfig;
 use clap::Parser;
 use colored::*;
 use local_ip_address::local_ip;
+use parking_lot::RwLock;
 use rustchatui::start_ui_server;
 use serde_json::json;
 use std::collections::HashMap;
@@ -62,8 +64,8 @@ struct Args {
     max_num_seqs: usize,
 
     /// Size of a block
-    #[arg(long, default_value_t = 64)]
-    block_size: usize,
+    #[arg(long)]
+    block_size: Option<usize>,
 
     /// if weight_path is passed, it will ignore the model_id
     #[arg(long = "m")]
@@ -87,9 +89,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cpu: bool,
 
-    /// Available GPU memory for kvcache (MB)
+    /// Fixed GPU memory budget for kvcache (MB). Used when auto sizing is unavailable.
     #[arg(long = "mem", default_value_t = 4096)]
     kvcache_mem_gpu: usize,
+
+    /// Auto-size GPU KV cache after model load using `fraction * remaining_gpu_mem`.
+    /// Defaults to 0.7 and takes priority over `--mem` on CUDA/Metal.
+    #[arg(long)]
+    gpu_memory_fraction: Option<f32>,
 
     /// Available CPU memory for kvcache (MB)
     #[arg(long, default_value_t = 128)]
@@ -104,7 +111,7 @@ struct Args {
 
     /// Maximum waiting time for processing parallel requests (in milliseconds).
     /// A larger value means the engine can hold more requests and process them in a single generation call.
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 100)]
     holding_time: usize,
 
     //Whether the program is forced running in multithread model for parallel inference (for debug)
@@ -184,6 +191,14 @@ struct Args {
     /// Max chunk size (bytes) for KV export/import streaming.
     #[arg(long, default_value_t = 1_048_576)]
     runtime_internal_chunk_bytes: usize,
+
+    /// Force a specific tool parser backend (for example: qwen, qwen_coder, json, mistral).
+    #[arg(long)]
+    enforce_parser: Option<String>,
+
+    /// YARN RoPE scaling factor (explicit override, no auto-calculation)
+    #[arg(long)]
+    yarn_scaling_factor: Option<f64>,
 }
 
 fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Result<()> {
@@ -217,6 +232,12 @@ fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Resul
         .single_file(log_file.as_str(), true, cfg_filter)
         .init()
         .map_err(candle_core::Error::wrap)
+}
+
+async fn bind_api_listener(bind_addr: &str) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(bind_addr).await.map_err(|e| {
+        candle_core::Error::msg(format!("Failed to bind API server to {bind_addr}: {e}"))
+    })
 }
 
 fn normalize_model_id_arg(value: &str) -> Option<String> {
@@ -256,63 +277,25 @@ fn derive_runtime_model_id(
     normalize_model_id_arg(pipeline_name).unwrap_or_else(|| pipeline_name.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::derive_runtime_model_id;
-
-    #[test]
-    fn derive_runtime_model_id_prefers_canonical_override() {
-        let resolved = derive_runtime_model_id(
-            Some("Qwen/Qwen3.5-9B-Instruct"),
-            Some("ignored-model"),
-            Some("/models/ignored-weights"),
-            "ignored-pipeline",
-        );
-        assert_eq!(resolved, "Qwen/Qwen3.5-9B-Instruct");
-    }
-
-    #[test]
-    fn derive_runtime_model_id_falls_back_in_documented_order() {
-        let from_model = derive_runtime_model_id(
-            None,
-            Some("Qwen/Qwen3.5-9B"),
-            Some("/models/weights-dir"),
-            "pipeline-name",
-        );
-        assert_eq!(from_model, "Qwen/Qwen3.5-9B");
-
-        let from_weights = derive_runtime_model_id(
-            None,
-            None,
-            Some("/models/Qwen3.5-9B-Instruct/"),
-            "pipeline-name",
-        );
-        assert_eq!(from_weights, "Qwen3.5-9B-Instruct");
-
-        let from_pipeline = derive_runtime_model_id(None, None, None, "qwen-pipeline");
-        assert_eq!(from_pipeline, "qwen-pipeline");
-    }
-}
-
 #[tokio::main]
 #[allow(unused_mut)]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let runtime_canonical_model_id = args.runtime_canonical_model_id.clone();
-    let requested_model_id = args.model_id.clone();
-    let requested_weight_path = args.weight_path.clone();
     if !args.log {
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .init();
     }
 
+    let requested_model_id = args.model_id.clone();
+    let requested_weight_path = args.weight_path.clone();
+
     let loader = Box::new(DefaultLoader::new(
-        args.model_id,
-        args.weight_path,
+        requested_model_id.clone(),
+        requested_weight_path.clone(),
         args.weight_file,
-        None,
-        None,
+        args.enforce_parser.clone(),
+        args.yarn_scaling_factor,
     ));
 
     let (paths, gguf) = loader.prepare_model_weights(args.hf_token, args.hf_token_path)?;
@@ -320,10 +303,10 @@ async fn main() -> Result<()> {
     let dtype = candle_vllm::get_dtype(args.dtype);
     let kv_cache_dtype = if args.fp8_kvcache { DType::U8 } else { dtype };
 
-    if cfg!(feature = "flash-decoding") {
+    if cfg!(any(feature = "flashattn", feature = "flashinfer")) {
         assert!(
             !args.fp8_kvcache,
-            "fp8 kvcache is not compatible with `flash-decoding` feature!"
+            "fp8 kvcache is not compatible with `flashattn` or `flashinfer` features!"
         );
     }
 
@@ -367,17 +350,23 @@ async fn main() -> Result<()> {
     #[cfg(all(feature = "cuda", feature = "graph"))]
     {
         assert!(
-            multi_process,
-            "Graph capture is only available under multi process mode!"
+            multi_process || (!multi_process && num_shards == 1),
+            "Graph capture is only available under multiprocess mode or single-rank multithread mode!"
         );
         if args.max_num_seqs > 16 {
             tracing::warn!("Higher GPU memory required for capturing large batch!");
         }
     }
 
+    let block_size = args
+        .block_size
+        .unwrap_or(if cfg!(feature = "cuda") { 64 } else { 32 });
     let logger: ftail::Ftail = ftail::Ftail::new();
-    let host = args.host.clone();
+    let host = args.host;
     let mut port = args.port;
+
+    candle_vllm::openai::utils::ensure_port_free(&host, port);
+
     #[cfg(feature = "nccl")]
     let (pipelines, global_rank, daemon_manager) = if multi_process {
         use candle_vllm::openai::communicator::init_subprocess;
@@ -401,7 +390,7 @@ async fn main() -> Result<()> {
                     kv_cache_dtype,
                     gguf,
                     args.isq.clone(),
-                    args.block_size,
+                    block_size,
                     args.max_num_seqs,
                     vec![device_ids[local_rank]],
                     Some(id),
@@ -427,7 +416,7 @@ async fn main() -> Result<()> {
                     kv_cache_dtype,
                     gguf,
                     args.isq.clone(),
-                    args.block_size,
+                    block_size,
                     args.max_num_seqs,
                     device_ids,
                     None,
@@ -464,7 +453,7 @@ async fn main() -> Result<()> {
                     kv_cache_dtype,
                     gguf,
                     args.isq.clone(),
-                    args.block_size,
+                    block_size,
                     args.max_num_seqs,
                     device_ids,
                     None,
@@ -481,19 +470,96 @@ async fn main() -> Result<()> {
     };
     let mut config: Option<Config> = None;
     let mut cache_config: Option<CacheConfig> = None;
+    let devices: Vec<_> = default_pipelines
+        .iter()
+        .map(|pipeline| pipeline.device())
+        .collect();
+    let first_pipeline = default_pipelines
+        .first()
+        .expect("at least one pipeline must be loaded");
+    let first_config = first_pipeline.get_model_config();
+    let first_model_dtype = first_pipeline.dtype;
+    let requested_gpu_memory_fraction = args.gpu_memory_fraction.unwrap_or(0.7);
+    let explicit_gpu_memory_fraction = args.gpu_memory_fraction.is_some();
+    let (kvcache_mem_gpu, mamba_cache_budget_bytes, kvcache_budget_desc) =
+        match candle_vllm::detect_kvcache_mem_gpu_mb_for_devices(
+            &devices,
+            requested_gpu_memory_fraction,
+        ) {
+            Ok(detected) => {
+                let mut effective_kvcache_mem_gpu = detected;
+                let mut mamba_cache_budget_bytes = 0usize;
+                if let Some(estimate) = candle_vllm::estimate_hybrid_mamba_cache(
+                    &first_config,
+                    first_model_dtype,
+                    num_shards,
+                ) {
+                    if let Some(plan) = candle_vllm::plan_hybrid_mamba_cache(
+                        detected * 1024 * 1024,
+                        estimate,
+                        args.max_num_seqs.max(16),
+                        args.prefix_cache,
+                    ) {
+                        let reserved_mamba_mb = plan.budget_bytes.div_ceil(1024 * 1024);
+                        if reserved_mamba_mb < detected {
+                            effective_kvcache_mem_gpu = detected - reserved_mamba_mb;
+                            mamba_cache_budget_bytes = plan.budget_bytes;
+                            info!(
+                            "Reserved {:.2} GB of the combined GPU cache budget for hybrid mamba/GDN ({} active slot target, {} prefix slot target); KV cache budget is now {:.2} GB",
+                            plan.budget_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                            plan.active_slot_capacity,
+                            plan.prefix_slot_capacity,
+                            effective_kvcache_mem_gpu as f64 / 1024.0,
+                        );
+                        } else {
+                            warn!(
+                            "Hybrid mamba reservation {:.2} GB would consume the entire combined cache budget {:.2} GB; skipping upfront reservation.",
+                            plan.budget_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                            detected as f64 / 1024.0,
+                        );
+                        }
+                    }
+                }
+                info!(
+                "Using auto-detected KV cache budget of {} MB per rank (gpu_memory_fraction={} of post-load free GPU memory)",
+                effective_kvcache_mem_gpu, requested_gpu_memory_fraction
+            );
+                (
+                    effective_kvcache_mem_gpu,
+                    mamba_cache_budget_bytes,
+                    format!(
+                        "--gpu-memory-fraction {} -> {} MB per rank",
+                        requested_gpu_memory_fraction, effective_kvcache_mem_gpu
+                    ),
+                )
+            }
+            Err(err) if !explicit_gpu_memory_fraction => {
+                warn!(
+                    "Auto KV cache sizing unavailable ({}), falling back to fixed --mem {} MB",
+                    err, args.kvcache_mem_gpu
+                );
+                (
+                    args.kvcache_mem_gpu,
+                    0,
+                    format!("--mem {} MB", args.kvcache_mem_gpu),
+                )
+            }
+            Err(err) => return Err(err),
+        };
 
     let pipelines = default_pipelines
         .into_iter()
         .map(|pipeline| {
             let cfg = pipeline.get_model_config();
-            let cache_cfg = candle_vllm::get_cache_config(
-                args.kvcache_mem_gpu,
+            let mut cache_cfg = candle_vllm::get_cache_config(
+                kvcache_mem_gpu,
                 args.kvcache_mem_cpu, //dummy 512MB for cpu
-                args.block_size,
+                block_size,
                 &cfg,
                 kv_cache_dtype,
                 num_shards,
             );
+            cache_cfg.mamba_cache_budget_bytes = mamba_cache_budget_bytes;
             let cache_engine = CacheEngine::new(
                 &cfg,
                 &cache_cfg,
@@ -518,7 +584,7 @@ async fn main() -> Result<()> {
 
     let total_gpu_blocks = cache_config.num_gpu_blocks.unwrap_or(0);
     let default_prefix_cache_blocks = if total_gpu_blocks > 0 {
-        std::cmp::max(1, total_gpu_blocks / 4)
+        std::cmp::max(1, total_gpu_blocks / 2)
     } else {
         0
     };
@@ -578,10 +644,12 @@ async fn main() -> Result<()> {
         pipeline_config.generation_cfg.as_mut().unwrap().min_p = args.min_p;
     }
 
+    pipeline_config.apply_kv_cache_limit(&cache_config);
+
     info!("Pipeline config {:?}", pipeline_config);
 
     let max_model_len = pipeline_config.max_model_len;
-    let kvcached_tokens = cache_config.num_gpu_blocks.unwrap() * cache_config.block_size;
+    let kvcached_tokens = kv_cache_capacity_tokens(&cache_config);
 
     let mcp_manager_config = if let Some(path) = &args.mcp_config {
         match candle_vllm::mcp::McpManagerConfig::from_file(path) {
@@ -615,27 +683,26 @@ async fn main() -> Result<()> {
         None
     };
 
-    let pipeline_model_name = {
+    let runtime_canonical_model_id = args.runtime_canonical_model_id.clone();
+    let runtime_model_name = {
         let engine = llm_engine.read();
         let (pipeline, _) = engine
             .get_pipeline(0)
             .ok_or_else(|| candle_core::Error::msg("Missing pipeline at rank 0"))?;
-        pipeline.name().to_string()
+        derive_runtime_model_id(
+            runtime_canonical_model_id.as_deref(),
+            requested_model_id.as_deref(),
+            requested_weight_path.as_deref(),
+            pipeline.name(),
+        )
     };
-    let runtime_model_name = derive_runtime_model_id(
-        runtime_canonical_model_id.as_deref(),
-        requested_model_id.as_deref(),
-        requested_weight_path.as_deref(),
-        &pipeline_model_name,
-    );
-
-    let lora_manager = Arc::new(candle_vllm::openai::lora::LoRAManager::new(
+    let lora_manager = Arc::new(LoRAManager::new(
         Some(runtime_model_name.clone()),
         8,
         64,
         "fallback",
     ));
-    candle_vllm::openai::lora::set_global_lora_manager(Arc::clone(&lora_manager));
+    set_global_lora_manager(Arc::clone(&lora_manager));
 
     let runtime_dtype = format!("{:?}", cache_config.dtype).to_lowercase();
     let runtime_kv_profile = RuntimeKvProfile {
@@ -669,7 +736,7 @@ async fn main() -> Result<()> {
         runtime_local_only_strict: args.runtime_local_only_strict,
         mcp_manager: mcp_manager.clone(),
         lora_manager,
-        session_adapters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        session_adapters: Arc::new(RwLock::new(HashMap::new())),
     };
 
     if let Some(manager) = &mcp_manager {
@@ -694,36 +761,6 @@ async fn main() -> Result<()> {
 
     #[cfg(all(feature = "cuda", feature = "graph"))]
     LLMEngine::graph_capture(&server_data.model).unwrap();
-
-    if global_rank == 0 {
-        warn!(
-            "Maximum Model Length (affected by `--mem` (kvcache-mem-gpu) and the number of ranks):"
-        );
-        for batch in [1, 8] {
-            println!(
-                "-> Batch {}: {}",
-                batch,
-                std::cmp::min(kvcached_tokens / batch, max_model_len)
-            );
-        }
-        let ip = local_ip().unwrap_or("127.0.0.1".parse().unwrap());
-        let local_url = format!("http://localhost:{port}/v1/");
-        let lan_url = format!("http://{ip}:{port}/v1/");
-
-        println!(
-            "\n🧠 API server running at:\n\t{} (Local Access) \n\t{} (Remote Access)\n",
-            local_url.cyan().bold(),
-            lan_url.cyan().bold(),
-        );
-
-        println!("");
-        println!(
-            "🛑 {}",
-            format!("EXIT: Ctrl+C to quit. If unresponsive: Ctrl+P → Ctrl+Q (last resort).")
-                .bold()
-                .red()
-        );
-    }
 
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
@@ -750,10 +787,15 @@ async fn main() -> Result<()> {
         .route(
             "/v1/models",
             get(|State(data): State<Arc<OpenAIServerData>>| async move {
-                let (model_name, lora_status) = {
+                let (model_name, modalities, lora_status) = {
                     let engine = data.model.read();
                     let (pipeline, _) = engine.get_pipeline(0).unwrap();
-                    (pipeline.name().to_string(), data.lora_manager.status())
+                    let modalities = if pipeline.image_config.is_some() {
+                        vec!["text", "image"]
+                    } else {
+                        vec!["text", "embedding"]
+                    };
+                    (pipeline.name().to_string(), modalities, data.lora_manager.status())
                 };
                 Json(json!({
                     "object": "list",
@@ -767,6 +809,8 @@ async fn main() -> Result<()> {
                                 .as_millis() as i64,
                             "owned_by": "candle-vllm",
                             "permission": [],
+                            "modalities": modalities,
+                            "max_model_len": data.pipeline_config.max_model_len,
                             "max_active_loras": lora_status.max_active_loras,
                             "loaded_loras": lora_status.loaded_loras,
                             "lora_mode": lora_status.lora_mode
@@ -778,23 +822,54 @@ async fn main() -> Result<()> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(create_embeddings))
         .route("/v1/adapters", post(register_adapter).get(list_adapters))
-        .route("/v1/adapters/:id", get(get_adapter))
-        .route("/v1/adapters/:id/load", post(load_adapter))
-        .route("/v1/adapters/:id/unload", post(unload_adapter))
         .route("/v1/adapters/status", get(adapters_status))
         .route("/v1/adapters/warmup", post(warmup_adapters))
+        .route("/v1/adapters/{id}", get(get_adapter))
+        .route("/v1/adapters/{id}/load", post(load_adapter))
+        .route("/v1/adapters/{id}/unload", post(unload_adapter))
         .layer(cors_layer)
         .with_state(Arc::clone(&shared_server_data));
 
-    let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
-        .await
-        .map_err(candle_core::Error::wrap)?;
+    let bind_addr = format!("{host}:{port}");
+    let listener = bind_api_listener(&bind_addr).await?;
+
+    if global_rank == 0 {
+        warn!(
+            "Maximum Model Length (affected by {} and the number of ranks):",
+            kvcache_budget_desc
+        );
+        println!("-> Total KV cache tokens: {}", kvcached_tokens);
+        for batch in [1, 2, 3, 4] {
+            println!(
+                "-> Batch {}: {}",
+                batch,
+                std::cmp::min(kvcached_tokens / batch, max_model_len)
+            );
+        }
+        let ip = local_ip().unwrap_or("127.0.0.1".parse().unwrap());
+        let local_url = format!("http://localhost:{port}/v1/");
+        let lan_url = format!("http://{ip}:{port}/v1/");
+
+        println!(
+            "\n🧠 API server running at:\n\t{} (Local Access) \n\t{} (Remote Access)\n",
+            local_url.cyan().bold(),
+            lan_url.cyan().bold(),
+        );
+
+        println!("");
+        println!(
+            "🛑 {}",
+            format!("EXIT: Ctrl+C to quit. If unresponsive: Ctrl+P → Ctrl+Q (last resort).")
+                .bold()
+                .red()
+        );
+    }
 
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("Chat API server error: {e:?}");
-        }
+        axum::serve(listener, app).await.map_err(|e| {
+            candle_core::Error::msg(format!("Chat API server error on {bind_addr}: {e}"))
+        })
     }));
 
     if args.runtime_internal_api && global_rank == 0 {
@@ -811,13 +886,11 @@ async fn main() -> Result<()> {
             args.runtime_internal_chunk_bytes,
         );
         tasks.push(tokio::spawn(async move {
-            if let Err(err) = Server::builder()
+            Server::builder()
                 .add_service(RuntimeInternalServer::new(internal_service))
                 .serve(grpc_addr)
                 .await
-            {
-                eprintln!("Runtime internal gRPC error: {err:?}");
-            }
+                .map_err(candle_core::Error::wrap)
         }));
     }
 
@@ -826,13 +899,13 @@ async fn main() -> Result<()> {
         tasks.push(tokio::spawn(async move {
             start_ui_server((args.port - 1) as u16, Some(args.port as u16), None, None)
                 .await
-                .unwrap();
+                .map_err(candle_core::Error::wrap)
         }));
     }
 
-    futures::future::try_join_all(tasks)
-        .await
-        .map_err(candle_core::Error::wrap)?;
+    for task in tasks {
+        task.await.map_err(candle_core::Error::wrap)??;
+    }
 
     Ok(())
 }

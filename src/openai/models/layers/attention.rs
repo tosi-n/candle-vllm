@@ -36,6 +36,8 @@ pub struct Attention {
     dtype: DType,
     attn_output_gate: bool,
     no_per_head_norm: bool,
+    qk_l2_norm: bool,
+    v_norm_eps: Option<f64>,
 }
 
 impl Attention {
@@ -192,6 +194,7 @@ impl Attention {
         dtype: DType,
         quant_cfg: &Option<crate::openai::models::QuantConfig>,
         quant: &Option<String>,
+        k_eq_v: bool,
     ) -> Result<Option<QkvProjection>> {
         if quant.is_some() {
             return Ok(None);
@@ -201,7 +204,11 @@ impl Attention {
         let kv_shard = shard(0, comm.rank(), comm.world_size());
         let q_vb = vb.pp("q_proj");
         let k_vb = vb.pp("k_proj");
-        let v_vb = vb.pp("v_proj");
+        let v_vb = if k_eq_v {
+            vb.pp("k_proj")
+        } else {
+            vb.pp("v_proj")
+        };
 
         let is_fp8_quant = quant_cfg
             .as_ref()
@@ -349,6 +356,26 @@ impl Attention {
         comm: Rc<Comm>,
         sliding_window: Option<usize>,
     ) -> Result<Self> {
+        Self::new_with_option(
+            rotary_emb,
+            cfg,
+            vb.clone(),
+            comm,
+            sliding_window,
+            false,
+            None,
+        )
+    }
+
+    pub fn new_with_option(
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
+        cfg: &Config,
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+        sliding_window: Option<usize>,
+        k_eq_v: bool,
+        attention_scale: Option<f32>,
+    ) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads.unwrap();
@@ -391,6 +418,7 @@ impl Attention {
             vb.dtype(),
             &cfg.quantization_config,
             &cfg.isq_quant,
+            k_eq_v,
         )? {
             packed
         } else {
@@ -429,7 +457,7 @@ impl Attention {
                 hidden_sz,
                 num_kv_heads * head_dim,
                 attention_bias,
-                vb.pp("v_proj"),
+                vb.pp(if k_eq_v { "k_proj" } else { "v_proj" }),
                 comm.clone(),
                 v_proj_quant,
                 &cfg.quantization_config,
@@ -469,6 +497,30 @@ impl Attention {
         )
         .ok();
 
+        let is_gemma4 = arch == "Gemma4ForConditionalGeneration" || arch == "Gemma4ForCausalLM";
+        let v_norm_eps = if is_gemma4 {
+            Some(cfg.rms_norm_eps)
+        } else {
+            None
+        };
+        let no_per_head_norm_models: Vec<String> = vec![
+            "Gemma3ForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForConditionalGeneration",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
         assert!(cfg.num_attention_heads >= comm.world_size());
         assert!(cfg.num_attention_heads % comm.world_size() == 0);
 
@@ -489,7 +541,7 @@ impl Attention {
             attn: PagedAttention::new(
                 attention_heads,
                 head_dim,
-                1. / ((head_dim as f32).sqrt()),
+                attention_scale.unwrap_or(1. / ((head_dim as f32).sqrt())),
                 Some(kv_heads),
                 sliding_window,
                 vb.device().clone(),
@@ -499,17 +551,25 @@ impl Attention {
             softcapping: cfg.attn_logit_softcapping,
             dtype: vb.dtype(),
             attn_output_gate,
-            no_per_head_norm: is_qwen35_or_next,
+            no_per_head_norm: no_per_head_norm_models.contains(&arch),
+            qk_l2_norm: false,
+            v_norm_eps,
         })
     }
 
-    pub fn forward(
+    pub fn set_qk_l2_norm(&mut self, enable: bool) {
+        self.qk_l2_norm = enable;
+    }
+
+    pub fn forward_ext(
         &self,
         xs: &Tensor,
+        rotary_emb: Option<&ScalingRotaryEmbedding>,
         attention_mask: Option<&Vec<Tensor>>,
         input_positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
+        q_scale: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
@@ -590,10 +650,34 @@ impl Attention {
             (q, k)
         };
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
+        let (mut q, mut k) = if let Some(rotary_emb) = rotary_emb {
+            rotary_emb.apply_rotary_emb(&q, &k, input_positions)?
+        } else {
+            (q, k)
+        };
+        if self.qk_l2_norm {
+            let q_rms = (q.sqr()?.mean_keepdim(candle_core::D::Minus1)? + 1e-5)?.sqrt()?;
+            let k_rms = (k.sqr()?.mean_keepdim(candle_core::D::Minus1)? + 1e-5)?.sqrt()?;
+            q = q.broadcast_div(&q_rms)?;
+            k = k.broadcast_div(&k_rms)?;
+        }
+        if let Some(scale) = q_scale {
+            let scale = scale.reshape((seq_len, 1, 1))?;
+            q = q.broadcast_mul(&scale.to_dtype(q.dtype())?)?;
+        }
         let (q, k) = (q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?);
         let v = if v.dtype() != self.dtype {
             v.to_dtype(self.dtype)?
+        } else {
+            v
+        };
+
+        let v = if let Some(eps) = self.v_norm_eps {
+            let orig_dtype = v.dtype();
+            let v_f32 = v.to_dtype(DType::F32)?;
+            let mean_sq = v_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let rms = (mean_sq + eps)?.sqrt()?;
+            v_f32.broadcast_div(&rms)?.to_dtype(orig_dtype)?
         } else {
             v
         };
@@ -626,6 +710,25 @@ impl Attention {
         let y = self.o_proj.forward(&y.to_dtype(xs.dtype())?)?;
         Ok(y)
     }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        self.forward_ext(
+            xs,
+            Some(self.rotary_emb.as_ref()),
+            attention_mask,
+            input_positions,
+            cache,
+            input_metadata,
+            None,
+        )
+    }
 }
 
 pub struct QuantizedAttention {
@@ -641,6 +744,7 @@ pub struct QuantizedAttention {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    attn_output_gate: bool,
     attn: PagedAttention,
     rotary_emb: Arc<ScalingRotaryEmbedding>,
     dtype: DType,
@@ -717,6 +821,11 @@ impl QuantizedAttention {
         let head_dim = config
             .head_dim
             .unwrap_or(config.hidden_size / config.num_attention_heads);
+        let n_head = config.num_attention_heads;
+        let expected_q_dim = n_head * head_dim;
+        let q_out_dim = attention_wq.shape().dims()[0];
+        let attn_output_gate = q_out_dim == expected_q_dim * 2;
+
         Ok(QuantizedAttention {
             attention_wq: QMatMul::from_qtensor(attention_wq)?,
             attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -727,11 +836,12 @@ impl QuantizedAttention {
             attention_wo: QMatMul::from_qtensor(attention_wo)?,
             q_norm,
             k_norm,
-            n_head: config.num_attention_heads,
+            n_head,
             n_kv_head: config
                 .num_key_value_heads
                 .unwrap_or(config.num_attention_heads),
             head_dim,
+            attn_output_gate,
             attn: PagedAttention::new(
                 config.num_attention_heads,
                 head_dim,
@@ -757,29 +867,42 @@ impl QuantizedAttention {
     ) -> Result<Tensor> {
         let (seq_len, _) = x.dims2()?;
 
-        let q = self.attention_wq.forward(x)?;
+        let q_raw = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
 
-        let q = if self.attention_bq.is_some() {
-            q.broadcast_add(self.attention_bq.as_ref().unwrap())?
+        let q_raw = if let Some(bq) = &self.attention_bq {
+            q_raw.broadcast_add(bq)?
         } else {
-            q
+            q_raw
         };
 
-        let k = if self.attention_bk.is_some() {
-            k.broadcast_add(self.attention_bk.as_ref().unwrap())?
+        let k = if let Some(bk) = &self.attention_bk {
+            k.broadcast_add(bk)?
         } else {
             k
         };
 
-        let v = if self.attention_bv.is_some() {
-            v.broadcast_add(self.attention_bv.as_ref().unwrap())?
+        let v = if let Some(bv) = &self.attention_bv {
+            v.broadcast_add(bv)?
         } else {
             v
         };
 
-        let q = q.reshape((seq_len, self.n_head, self.head_dim))?;
+        let local_q_dim = self.n_head * self.head_dim;
+        let (q_linear, gate) = if self.attn_output_gate {
+            let q_gate = q_raw.reshape((seq_len, self.n_head, self.head_dim * 2))?;
+            let q = q_gate.narrow(2, 0, self.head_dim)?;
+            let gate = q_gate.narrow(2, self.head_dim, self.head_dim)?;
+            (
+                q.reshape((seq_len, local_q_dim))?,
+                Some(gate.reshape((seq_len, local_q_dim))?),
+            )
+        } else {
+            (q_raw, None)
+        };
+
+        let q = q_linear.reshape((seq_len, self.n_head, self.head_dim))?;
         let k = k.reshape((seq_len, self.n_kv_head, self.head_dim))?;
         let v = v.reshape((seq_len, self.n_kv_head, self.head_dim))?;
 
@@ -821,7 +944,13 @@ impl QuantizedAttention {
             )?
             .reshape((seq_len, ()))?;
 
-        let y = self.attention_wo.forward(&y.to_dtype(x.dtype())?)?;
-        Ok(y)
+        let y = if let Some(gate) = gate {
+            let gate = gate.to_dtype(y.dtype())?;
+            y.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?)?
+        } else {
+            y
+        };
+
+        self.attention_wo.forward(&y.to_dtype(DType::F32)?)
     }
 }
