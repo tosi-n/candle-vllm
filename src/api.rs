@@ -231,32 +231,17 @@ impl EngineBuilder {
         let first_config = first_pipeline.get_model_config();
         let first_model_dtype = first_pipeline.dtype;
         let devices: Vec<_> = pipelines.iter().map(|pipeline| pipeline.device()).collect();
-        let (kvcache_mem_gpu, mamba_cache_budget_bytes) = match self.gpu_memory_fraction {
-            Some(gpu_memory_fraction) => {
-                let detected =
-                    crate::detect_kvcache_mem_gpu_mb_for_devices(&devices, gpu_memory_fraction)?;
-                let mut effective_kvcache_mem_gpu = detected;
-                let mut mamba_cache_budget_bytes = 0usize;
-                if let Some(estimate) =
-                    crate::estimate_hybrid_mamba_cache(&first_config, first_model_dtype, num_shards)
-                {
-                    if let Some(plan) = crate::plan_hybrid_mamba_cache(
-                        detected * 1024 * 1024,
-                        estimate,
-                        self.max_num_seqs.max(16),
-                        false,
-                    ) {
-                        let reserved_mamba_mb = plan.budget_bytes.div_ceil(1024 * 1024);
-                        if reserved_mamba_mb < detected {
-                            effective_kvcache_mem_gpu = detected - reserved_mamba_mb;
-                            mamba_cache_budget_bytes = plan.budget_bytes;
-                        }
-                    }
-                }
-                (effective_kvcache_mem_gpu, mamba_cache_budget_bytes)
-            }
-            None => (self.kvcache_mem_gpu, 0),
-        };
+        let (kvcache_mem_gpu, mamba_cache_budget_bytes) =
+            crate::resolve_kvcache_budget_for_devices(
+                &devices,
+                self.gpu_memory_fraction,
+                self.kvcache_mem_gpu,
+                &first_config,
+                first_model_dtype,
+                num_shards,
+                self.max_num_seqs.max(16),
+                false,
+            )?;
 
         let pipelines: HashMap<
             usize,

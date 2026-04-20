@@ -304,6 +304,42 @@ pub fn detect_kvcache_mem_gpu_mb_for_devices(
     min_budget_mb.ok_or_else(|| candle::Error::msg("No devices available for KV cache sizing"))
 }
 
+pub fn resolve_kvcache_budget_for_devices(
+    devices: &[&Device],
+    gpu_memory_fraction: Option<f32>,
+    fallback_kvcache_mem_gpu: usize,
+    model_config: &crate::openai::models::Config,
+    model_dtype: candle::DType,
+    num_shards: usize,
+    min_active_slots: usize,
+    prefix_cache_enabled: bool,
+) -> Result<(usize, usize)> {
+    let Some(gpu_memory_fraction) = gpu_memory_fraction else {
+        return Ok((fallback_kvcache_mem_gpu, 0));
+    };
+
+    let detected = detect_kvcache_mem_gpu_mb_for_devices(devices, gpu_memory_fraction)?;
+    let mut effective_kvcache_mem_gpu = detected;
+    let mut mamba_cache_budget_bytes = 0usize;
+
+    if let Some(estimate) = estimate_hybrid_mamba_cache(model_config, model_dtype, num_shards) {
+        if let Some(plan) = plan_hybrid_mamba_cache(
+            detected * SIZE_IN_MB,
+            estimate,
+            min_active_slots,
+            prefix_cache_enabled,
+        ) {
+            let reserved_mamba_mb = plan.budget_bytes.div_ceil(SIZE_IN_MB);
+            if reserved_mamba_mb < detected {
+                effective_kvcache_mem_gpu = detected - reserved_mamba_mb;
+                mamba_cache_budget_bytes = plan.budget_bytes;
+            }
+        }
+    }
+
+    Ok((effective_kvcache_mem_gpu, mamba_cache_budget_bytes))
+}
+
 pub fn estimate_hybrid_mamba_cache(
     config: &crate::openai::models::Config,
     model_dtype: candle::DType,
