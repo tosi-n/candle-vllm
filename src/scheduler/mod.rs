@@ -179,6 +179,10 @@ impl Scheduler {
         let mut preempted = VecDeque::new();
         while !self.running.is_empty() {
             let seq_group = self.running.pop_front().unwrap();
+            if seq_group.is_decode_blocked() {
+                running.push_back(seq_group);
+                continue;
+            }
             let mut finished_with_break = false;
             while !self.block_engine.can_append_token_to_seq(&seq_group) {
                 // If we cannot, now we need to preempt some seqs
