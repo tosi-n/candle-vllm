@@ -1310,6 +1310,9 @@ mod tests {
             Vec::new(),
             None,
             false,
+            None,
+            None,
+            None,
         );
         (group, seq)
     }

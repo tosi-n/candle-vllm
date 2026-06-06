@@ -390,9 +390,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn block(block_id: usize, block_size: usize) -> Arc<PhysicalTokenBlock> {
-        Arc::new(PhysicalTokenBlock(Mutex::new(_PhysicalTokenBlock::new(
-            block_id, block_size, 1, true,
-        ))))
+        Arc::new(PhysicalTokenBlock(Mutex::new(_PhysicalTokenBlock {
+            block_id,
+            block_size,
+            refcount: 1,
+            is_gpu: true,
+        })))
     }
 
     #[test]
@@ -562,7 +565,7 @@ mod tests {
 
     #[test]
     fn seed_block_affects_only_target_block_hash() {
-        let mut cache = PrefixCache::new(
+        let cache = PrefixCache::new(
             4,
             PrefixCacheConfig {
                 enabled: true,

@@ -808,7 +808,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ScalingValue};
+    use super::{Config, KvCacheDtype, ScalingValue};
     use std::collections::HashMap;
 
     fn test_config(max_position_embeddings: usize) -> Config {
