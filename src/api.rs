@@ -1,4 +1,4 @@
-use crate::openai::models::Config;
+use crate::openai::models::{Config, KvCacheDtype};
 use crate::openai::multimodal::build_messages_and_images;
 use crate::openai::pipelines::llm_engine::LLMEngine;
 use crate::openai::pipelines::pipeline::DefaultLoader;
@@ -9,12 +9,16 @@ use crate::openai::PipelineConfig;
 use crate::scheduler::cache_engine::{CacheConfig, CacheEngine};
 use crate::scheduler::prefix_cache::PrefixCacheConfig;
 use crate::scheduler::SchedulerConfig;
-use crate::tools::ToolFormat;
+use crate::tools::helpers::{
+    build_invalid_tool_call_feedback, build_tool_schema_map, filter_tool_calls,
+};
 use candle_core::{DType, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
+
+const REQUEST_ADMISSION_DECODE_BUDGET_TOKENS: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub enum ModelRepo {
@@ -37,12 +41,13 @@ pub struct EngineBuilder {
     isq: Option<String>,
     dtype: Option<DType>,
     flash_attn: Option<bool>,
-    fp8_kvcache: Option<bool>,
+    kvcache_dtype: Option<KvCacheDtype>,
     device_ids: Option<Vec<usize>>,
     max_num_seqs: usize,
     block_size: usize,
     kvcache_mem_gpu: usize,
     gpu_memory_fraction: Option<f32>,
+    mamba_fraction: Option<f32>,
     kvcache_mem_cpu: usize,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -61,12 +66,13 @@ impl EngineBuilder {
             isq: None,
             dtype: None,
             flash_attn: None,
-            fp8_kvcache: None,
+            kvcache_dtype: None,
             device_ids: None,
-            max_num_seqs: 16,
+            max_num_seqs: 8,
             block_size: if cfg!(feature = "cuda") { 64 } else { 32 },
             kvcache_mem_gpu: 4096,
-            gpu_memory_fraction: Some(0.7),
+            gpu_memory_fraction: Some(0.5),
+            mamba_fraction: None,
             kvcache_mem_cpu: 128,
             temperature: None,
             top_p: None,
@@ -95,7 +101,12 @@ impl EngineBuilder {
     }
 
     pub fn with_fp8_kvcache(mut self) -> Self {
-        self.fp8_kvcache = Some(true);
+        self.kvcache_dtype = Some(KvCacheDtype::Fp8);
+        self
+    }
+
+    pub fn with_kvcache_dtype(mut self, kvcache_dtype: KvCacheDtype) -> Self {
+        self.kvcache_dtype = Some(kvcache_dtype);
         self
     }
 
@@ -121,6 +132,11 @@ impl EngineBuilder {
 
     pub fn with_gpu_memory_fraction(mut self, gpu_memory_fraction: f32) -> Self {
         self.gpu_memory_fraction = Some(gpu_memory_fraction);
+        self
+    }
+
+    pub fn with_mamba_fraction(mut self, mamba_fraction: f32) -> Self {
+        self.mamba_fraction = Some(mamba_fraction);
         self
     }
 
@@ -190,11 +206,13 @@ impl EngineBuilder {
         let (paths, gguf) = loader.prepare_model_weights(None, None)?;
 
         let dtype = self.dtype.unwrap_or_else(|| crate::get_dtype(None));
-        let kv_cache_dtype = if self.fp8_kvcache.unwrap_or(false) {
+        let kvcache_dtype_enum = self.kvcache_dtype.unwrap_or(KvCacheDtype::Auto);
+        let kv_cache_dtype = if kvcache_dtype_enum.is_fp8_keys() {
             DType::U8
         } else {
             dtype
         };
+        KvCacheDtype::set_global(kvcache_dtype_enum);
 
         let device_ids = self.device_ids.unwrap_or(vec![0]);
         // TODO: Handle multi-rank logic. For checking, stick to simpler single rank first or map to loader.
@@ -241,6 +259,7 @@ impl EngineBuilder {
                 num_shards,
                 self.max_num_seqs.max(16),
                 false,
+                self.mamba_fraction,
             )?;
 
         let pipelines: HashMap<
@@ -254,6 +273,9 @@ impl EngineBuilder {
             .enumerate()
             .map(|(rank, pipeline)| {
                 let cfg = pipeline.get_model_config();
+                let kvcache_dtype_enum = self
+                    .kvcache_dtype
+                    .unwrap_or(crate::openai::models::KvCacheDtype::Auto);
                 let mut cache_cfg = crate::get_cache_config(
                     kvcache_mem_gpu,
                     self.kvcache_mem_cpu,
@@ -261,6 +283,7 @@ impl EngineBuilder {
                     &cfg,
                     kv_cache_dtype,
                     num_shards,
+                    kvcache_dtype_enum,
                 );
                 cache_cfg.mamba_cache_budget_bytes = mamba_cache_budget_bytes;
 
@@ -290,6 +313,7 @@ impl EngineBuilder {
         let scheduler_config = SchedulerConfig {
             max_num_seqs: self.max_num_seqs,
             prefix_cache: PrefixCacheConfig::default(),
+            mamba_cache_capacity: None,
         };
 
         let notify = Arc::new(Notify::new());
@@ -308,6 +332,7 @@ impl EngineBuilder {
             #[cfg(feature = "nccl")]
             None,
             self.prefill_chunk_size,
+            false,
         )?;
 
         let mut pipeline_config = PipelineConfig {
@@ -366,7 +391,7 @@ use crate::openai::streaming::ChatResponse;
 use tracing::{info, warn};
 
 impl Engine {
-    /// Validates prompt length against model limits and available KV cache.
+    /// Validates prompt length against model limits.
     fn validate_prompt(&self, token_ids: &[u32], request_type: &str) -> Result<()> {
         let prompt_len = token_ids.len();
         let max_model_len = self.pipeline_config.max_model_len;
@@ -382,25 +407,9 @@ impl Engine {
             )));
         }
 
-        let available = {
-            let e = self.engine.read();
-            e.get_available_kv_tokens()
-        };
-
-        if prompt_len > available {
-            warn!(
-                "[{}] Prompt length {} exceeds available KV cache capacity {}",
-                request_type, prompt_len, available
-            );
-            return Err(candle_core::Error::msg(format!(
-                "Prompt length {} exceeds available KV cache capacity {}",
-                prompt_len, available
-            )));
-        }
-
         info!(
-            "[{}] Validated prompt with {} tokens (max: {}, available: {})",
-            request_type, prompt_len, max_model_len, available
+            "[{}] Validated prompt with {} tokens (max: {})",
+            request_type, prompt_len, max_model_len
         );
         Ok(())
     }
@@ -431,15 +440,16 @@ impl Engine {
                 .map_err(candle_core::Error::wrap)?;
         }
 
-        let (prompt, tokenizer, image_data) = {
+        let (prompt, tokenizer, image_data, resolved_tools) = {
             let e = self.engine.read();
-            let (pipeline, _) = e.get_pipeline(0).unwrap();
 
             let tool_config = resolve_tools_for_request(&request.tools, &request.tool_choice, None)
                 .map_err(candle_core::Error::wrap)?;
+            let resolved_tools = tool_config.tools.clone();
 
-            // tokenizer is inside DefaultPipeline
-            let mut conversation = pipeline.conversation.clone();
+            let tokenizer = e.tokenizer().clone();
+            let image_config = e.image_config();
+            let mut conversation = e.conversation();
             let mut image_data = None;
 
             // Logic to get prompt from messages
@@ -450,7 +460,7 @@ impl Engine {
                 }
                 Messages::Chat(messages) => {
                     let (render_messages, images) =
-                        build_messages_and_images(messages, pipeline.image_config.as_ref())
+                        build_messages_and_images(messages, image_config.as_ref())
                             .map_err(candle_core::Error::wrap)?;
                     image_data = images;
                     for message in render_messages {
@@ -484,35 +494,10 @@ impl Engine {
                 }
             };
 
-            if !tool_config.tools.is_empty() {
-                let mut tools_prompt = ToolFormat::get_tool_prompt(
-                    &pipeline.tool_config,
-                    &pipeline.tool_model_type,
-                    &pipeline.tool_parser_model_id,
-                    pipeline.enforce_parser.as_deref(),
-                );
-
-                // Enforce tool_choice=function
-                if let crate::openai::ToolChoiceKind::Function(name) = &tool_config.choice {
-                    tools_prompt = format!(
-                        "IMPORTANT: You MUST call the tool \"{}\". Do not respond with plain text.\n\n{}",
-                        name, tools_prompt
-                    );
-                }
-
-                let current_system = conversation.get_system_message().unwrap_or_default();
-                let new_system = if current_system.is_empty() {
-                    tools_prompt
-                } else {
-                    format!("{}\n\n{}", current_system, tools_prompt)
-                };
-                conversation.set_system_message(Some(new_system));
-            }
-
             let enable_thinking = request.thinking.unwrap_or(true);
             let prompt = conversation.get_prompt(enable_thinking, &tool_config.tools);
 
-            (prompt, pipeline.tokenizer.clone(), image_data)
+            (prompt, tokenizer, image_data, resolved_tools)
         };
 
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -531,6 +516,111 @@ impl Engine {
         // Validate prompt length
         self.validate_prompt(&token_ids, "generate_request")?;
 
+        let mut max_request_tokens = request.max_tokens.unwrap_or(16);
+        let max_model_decode_tokens = self
+            .pipeline_config
+            .max_model_len
+            .saturating_sub(token_ids.len())
+            .saturating_sub(10);
+        if max_request_tokens > max_model_decode_tokens {
+            warn!(
+                "[generate_request] Requested max_tokens {} exceeds remaining model context {}, max_tokens changed to {}",
+                max_request_tokens,
+                max_model_decode_tokens,
+                max_model_decode_tokens
+            );
+            max_request_tokens = max_model_decode_tokens;
+        }
+        if max_request_tokens == 0 {
+            return Err(candle_core::Error::msg(format!(
+                "Requested prompt({} tokens) leaves no room for generated tokens within maximum model context {}",
+                token_ids.len(),
+                self.pipeline_config.max_model_len
+            )));
+        }
+
+        let mut cached_tokens = {
+            let mut e = self.engine.write();
+            e.query_prefix_cache_match_tokens(&token_ids)
+        };
+        let mut new_tokens = token_ids.len().saturating_sub(cached_tokens);
+        let minimum_decode_budget_tokens =
+            max_request_tokens.min(REQUEST_ADMISSION_DECODE_BUDGET_TOKENS);
+        let mut target_required_tokens = new_tokens.saturating_add(max_request_tokens);
+        let mut minimum_required_tokens = new_tokens.saturating_add(minimum_decode_budget_tokens);
+        let mut available_tokens = {
+            let mut e = self.engine.write();
+            let (available_tokens, evicted) = e.ensure_available_kv_tokens(target_required_tokens);
+            if evicted > 0 {
+                warn!(
+                    "[generate_request] Evicted {} prefix cache block(s) to reserve {} KV tokens ({} new prompt + {} requested decode)",
+                    evicted,
+                    target_required_tokens,
+                    new_tokens,
+                    max_request_tokens
+                );
+            }
+            available_tokens
+        };
+        loop {
+            let refreshed_cached_tokens = {
+                let mut e = self.engine.write();
+                e.query_prefix_cache_match_tokens(&token_ids)
+            };
+            if refreshed_cached_tokens == cached_tokens {
+                break;
+            }
+
+            cached_tokens = refreshed_cached_tokens;
+            new_tokens = token_ids.len().saturating_sub(cached_tokens);
+            target_required_tokens = new_tokens.saturating_add(max_request_tokens);
+            minimum_required_tokens = new_tokens.saturating_add(minimum_decode_budget_tokens);
+            let (refreshed_available_tokens, evicted) = {
+                let mut e = self.engine.write();
+                e.ensure_available_kv_tokens(target_required_tokens)
+            };
+            if evicted > 0 {
+                warn!(
+                    "[generate_request] Evicted {} additional prefix cache block(s) after prefix-cache hit changed; reserving {} KV tokens ({} new prompt + {} requested decode)",
+                    evicted,
+                    target_required_tokens,
+                    new_tokens,
+                    max_request_tokens
+                );
+            }
+            available_tokens = refreshed_available_tokens;
+            if evicted == 0 {
+                break;
+            }
+        }
+        if minimum_required_tokens > available_tokens {
+            if available_tokens <= new_tokens {
+                return Err(candle_core::Error::msg(format!(
+                    "Requested prompt({} tokens, {} new after prefix cache) exceeds available KV cache capacity {}",
+                    token_ids.len(),
+                    new_tokens,
+                    available_tokens
+                )));
+            }
+            return Err(candle_core::Error::msg(format!(
+                "Requested prompt({} tokens, {} new after prefix cache) plus {} decode budget tokens exceeds available KV cache capacity {}",
+                token_ids.len(),
+                new_tokens,
+                minimum_decode_budget_tokens,
+                available_tokens
+            )));
+        }
+        if target_required_tokens > available_tokens {
+            warn!(
+                "[generate_request] Request admitted with {} KV tokens available, below requested reservation {} tokens but enough for {} new prompt tokens plus {} decode budget tokens ({} cached prompt tokens)",
+                available_tokens,
+                target_required_tokens,
+                new_tokens,
+                minimum_decode_budget_tokens,
+                cached_tokens
+            );
+        }
+
         // Let's create a local notify for this request.
         let req_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
@@ -538,7 +628,7 @@ impl Engine {
         let prefilled_reasoning_end =
             crate::tools::stream_parser::detect_prefilled_reasoning_end_marker(&prompt);
 
-        let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+        let has_tools = !resolved_tools.is_empty();
         {
             let mut e = self.engine.write();
             let mut sampling_params = SamplingParams::new(
@@ -557,7 +647,7 @@ impl Engine {
                 request.stop.clone(),
                 request.stop_token_ids.clone().unwrap_or_default(),
                 request.ignore_eos.unwrap_or(false),
-                request.max_tokens.unwrap_or(16),
+                max_request_tokens,
                 None,
                 None,
                 request.skip_special_tokens.unwrap_or(true),
@@ -574,7 +664,7 @@ impl Engine {
                 false, // is_embedding
                 crate::openai::requests::EncodingFormat::default(),
                 crate::openai::requests::EmbeddingType::default(),
-                request.tools.clone().unwrap_or_default(),
+                resolved_tools.clone(),
                 image_data,
                 None, // streamer
                 Some(req_notify.clone()),
@@ -597,13 +687,14 @@ impl Engine {
         }
 
         let e = self.engine.read();
-        let response_model = e
-            .get_pipeline(0)
-            .map(|(pipeline, _)| pipeline.name().to_string())
-            .unwrap_or_else(|| request.model.clone().unwrap_or("default".to_string()));
+        let response_model = if e.model_name().is_empty() {
+            request.model.clone().unwrap_or("default".to_string())
+        } else {
+            e.model_name().to_string()
+        };
         if let Some(record) = e.completion_records.get(&request_id) {
             let mut choices = record.0.clone();
-            if crate::stream_as_reasoning_content() && has_tools {
+            if crate::stream_as_reasoning_content() {
                 for choice in &mut choices {
                     if let Some(text) = choice.message.content.take() {
                         match crate::tools::stream_parser::extract_reasoning_content(&text) {
@@ -620,6 +711,45 @@ impl Engine {
                             }
                         }
                     }
+                }
+            }
+            if has_tools {
+                let parser = crate::tools::parser::ToolParser::new();
+                let tool_schemas = build_tool_schema_map(&resolved_tools);
+                for choice in &mut choices {
+                    let parsed_calls = if let Some(calls) = choice.message.tool_calls.take() {
+                        calls
+                    } else if let Some(content) = &choice.message.content {
+                        parser.parse(content)
+                    } else {
+                        Vec::new()
+                    };
+
+                    if parsed_calls.is_empty() {
+                        continue;
+                    }
+
+                    let (valid_calls, invalid_calls) =
+                        filter_tool_calls(&parsed_calls, &tool_schemas);
+                    if !invalid_calls.is_empty() {
+                        tracing::warn!(
+                            "Dropped {} invalid tool call(s) before response",
+                            invalid_calls.len()
+                        );
+                    }
+                    if valid_calls.is_empty() {
+                        if let Some(feedback) =
+                            build_invalid_tool_call_feedback(&invalid_calls, &tool_schemas, None)
+                        {
+                            choice.message.content = Some(feedback);
+                        }
+                        choice.finish_reason = Some("stop".to_string());
+                        continue;
+                    }
+
+                    choice.message.tool_calls = Some(valid_calls);
+                    choice.message.content = None;
+                    choice.finish_reason = Some("tool_calls".to_string());
                 }
             }
             Ok(ChatCompletionResponse {
@@ -646,7 +776,6 @@ impl Engine {
     pub async fn embed_async(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         let prompt_tokens = {
             let e = self.engine.read();
-            let (pipeline, _) = e.get_pipeline(0).unwrap();
 
             let prompt_str = match &request.input {
                 crate::openai::requests::EmbeddingInput::String(s) => s.clone(),
@@ -665,8 +794,7 @@ impl Engine {
                 }
             };
 
-            pipeline
-                .tokenizer
+            e.tokenizer()
                 .encode(prompt_str, false)
                 .map_err(candle_core::Error::msg)?
                 .get_ids()

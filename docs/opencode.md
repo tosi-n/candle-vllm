@@ -9,12 +9,11 @@ OpenCode -> Candle-vLLM (OpenAI-compatible)
 ## 1) Start candle-vLLM (at port 8000)
 
 ```bash
-cargo run --release --features cuda,nccl,graph,flashinfer,cutlass -- \
-  --m Qwen/Qwen3.5-27B-FP8 \
+cargo run --release --features cuda,nccl,flashinfer,cutlass -- \
+  --m Qwen/Qwen3.6-27B-FP8 \
   --d 0 \
-  --prefix-cache \
   --p 8000 \
-  --gpu-memory-fraction 0.7 \
+  --gpu-memory-fraction 0.5 \
   --enforce-parser qwen_coder
 ```
 
@@ -56,7 +55,7 @@ Create `~/.config/opencode/config.json`:
       },
       "models": {
         "qwen3-coder": {
-          "name": "Qwen/Qwen3.5-27B-FP8"
+          "name": "Qwen/Qwen3.6-27B-FP8"
         }
       }
     }

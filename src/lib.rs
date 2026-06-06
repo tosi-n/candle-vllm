@@ -121,53 +121,118 @@ pub fn get_cache_config(
     config: &crate::openai::models::Config,
     kv_dtype: candle::DType,
     num_shards: usize,
+    kvcache_dtype: crate::openai::models::KvCacheDtype,
 ) -> crate::scheduler::cache_engine::CacheConfig {
+    use crate::openai::models::KvCacheDtype;
+
+    let kvcache_dtype =
+        if kvcache_dtype.is_turboquant() && !cfg!(feature = "cuda") && !cfg!(feature = "metal") {
+            tracing::warn!(
+                "TurboQuant ({}) requires CUDA or Metal. Falling back to auto.",
+                kvcache_dtype
+            );
+            KvCacheDtype::Auto
+        } else if config.is_mla() && kvcache_dtype.is_turboquant() {
+            tracing::warn!(
+                "TurboQuant ({}) is not supported for MLA models. Falling back to auto.",
+                kvcache_dtype
+            );
+            KvCacheDtype::Auto
+        } else {
+            kvcache_dtype
+        };
+
     let kv_layers = config.kv_cache_num_layers().max(1);
     let dsize = kv_dtype.size_in_bytes();
     let size_in_mb = 1024 * 1024;
-    let (num_gpu_blocks, num_cpu_blocks) = if config.is_mla() {
-        let per_block = block_size
-            * (config.mla_kv_lora_rank() + config.mla_qk_rope_head_dim())
-            * dsize
-            * kv_layers;
-        let gpu = kvcache_mem_gpu * size_in_mb / per_block.max(1);
-        let cpu = kvcache_mem_cpu * size_in_mb / per_block.max(1);
-        (gpu, cpu)
-    } else if let Some(per_layer_cfg) = config.gemma4_per_layer_cache_config() {
-        // For Gemma4 with heterogeneous head_dim, calculate per-layer cache size
-        let mut total_per_block_bytes = 0usize;
-        for &(kv_heads, head_dim) in &per_layer_cfg {
+
+    let tq_full = matches!(kvcache_dtype, KvCacheDtype::Turbo4 | KvCacheDtype::Turbo3);
+
+    let base_per_block = if tq_full {
+        0
+    } else if config.is_mla() {
+        block_size * (config.mla_kv_lora_rank() + config.mla_qk_rope_head_dim()) * dsize * kv_layers
+    } else if let Some(ref per_layer_cfg) = config.gemma4_per_layer_cache_config() {
+        let mut total = 0usize;
+        for &(kv_heads, head_dim) in per_layer_cfg {
             let kv_heads_sharded = kv_heads / num_shards;
-            // 2 for key and value tensors
-            total_per_block_bytes += block_size * kv_heads_sharded * head_dim * dsize * 2;
+            total += block_size * kv_heads_sharded * head_dim * dsize * 2;
         }
-        let per_block = total_per_block_bytes.max(1);
-        let gpu = kvcache_mem_gpu * size_in_mb / per_block;
-        let cpu = kvcache_mem_cpu * size_in_mb / per_block;
-        (gpu, cpu)
+        total
     } else {
-        let num_gpu_blocks = kvcache_mem_gpu * size_in_mb
-            / dsize
-            / block_size
-            / (config.num_key_value_heads.unwrap() / num_shards)
-            / config.k_head_dim()
-            / kv_layers
-            / 2;
-        let num_cpu_blocks = kvcache_mem_cpu * size_in_mb
-            / dsize
-            / block_size
-            / (config.num_key_value_heads.unwrap() / num_shards)
-            / config.k_head_dim()
-            / kv_layers
-            / 2;
-        (num_gpu_blocks, num_cpu_blocks)
+        dsize
+            * block_size
+            * (config.num_key_value_heads.unwrap() / num_shards)
+            * config.k_head_dim()
+            * kv_layers
+            * 2
     };
+
+    let tq_per_block = match kvcache_dtype {
+        KvCacheDtype::Turbo8 => {
+            if let Some(ref per_layer_cfg) = config.gemma4_per_layer_cache_config() {
+                per_layer_cfg
+                    .iter()
+                    .map(|&(kv_heads, hd)| {
+                        let heads = kv_heads / num_shards;
+                        block_size * heads * 4 + block_size * heads * (hd / 2)
+                    })
+                    .sum()
+            } else {
+                let heads = config.num_key_value_heads.unwrap() / num_shards;
+                let hd = config.k_head_dim();
+                (block_size * heads * 4 + block_size * heads * (hd / 2)) * kv_layers
+            }
+        }
+        KvCacheDtype::Turbo4 => {
+            if let Some(ref per_layer_cfg) = config.gemma4_per_layer_cache_config() {
+                per_layer_cfg
+                    .iter()
+                    .map(|&(kv_heads, hd)| {
+                        let heads = kv_heads / num_shards;
+                        block_size * heads * 4 * 2 + block_size * heads * (hd / 2) * 2
+                    })
+                    .sum()
+            } else {
+                let heads = config.num_key_value_heads.unwrap() / num_shards;
+                let hd = config.k_head_dim();
+                (block_size * heads * 4 * 2 + block_size * heads * (hd / 2) * 2) * kv_layers
+            }
+        }
+        KvCacheDtype::Turbo3 => {
+            if let Some(ref per_layer_cfg) = config.gemma4_per_layer_cache_config() {
+                per_layer_cfg
+                    .iter()
+                    .map(|&(kv_heads, hd)| {
+                        let heads = kv_heads / num_shards;
+                        block_size * heads * 4 * 2
+                            + block_size * heads * ((hd * 3 + 7) / 8)
+                            + block_size * heads * (hd / 2)
+                    })
+                    .sum()
+            } else {
+                let heads = config.num_key_value_heads.unwrap() / num_shards;
+                let hd = config.k_head_dim();
+                (block_size * heads * 4 * 2
+                    + block_size * heads * ((hd * 3 + 7) / 8)
+                    + block_size * heads * (hd / 2))
+                    * kv_layers
+            }
+        }
+        _ => 0,
+    };
+
+    let per_block = (base_per_block + tq_per_block).max(1);
+    let num_gpu_blocks = kvcache_mem_gpu * size_in_mb / per_block;
+    let num_cpu_blocks = kvcache_mem_cpu * size_in_mb / per_block;
+
     crate::scheduler::cache_engine::CacheConfig {
         block_size,
         num_gpu_blocks: Some(num_gpu_blocks),
         num_cpu_blocks: Some(num_cpu_blocks),
         fully_init: true,
         dtype: kv_dtype,
+        kvcache_dtype,
         kvcache_mem_gpu,
         mamba_cache_budget_bytes: 0,
     }
@@ -209,7 +274,10 @@ pub struct HybridMambaCachePlan {
     pub budget_bytes: usize,
 }
 
-const DEFAULT_HYBRID_MAMBA_FRACTION: f32 = 0.1;
+const DEFAULT_HYBRID_MAMBA_FRACTION: f32 = 0.15;
+const MAX_HYBRID_MAMBA_FRACTION: f32 = 0.3;
+const HYBRID_MAMBA_PREFIX_SLOT_MULTIPLIER: usize = 2;
+const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 8;
 
 #[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
 fn compute_kvcache_budget_bytes(free_bytes: usize, fraction: f32) -> Result<usize> {
@@ -313,6 +381,7 @@ pub fn resolve_kvcache_budget_for_devices(
     num_shards: usize,
     min_active_slots: usize,
     prefix_cache_enabled: bool,
+    mamba_fraction: Option<f32>,
 ) -> Result<(usize, usize)> {
     let Some(gpu_memory_fraction) = gpu_memory_fraction else {
         return Ok((fallback_kvcache_mem_gpu, 0));
@@ -323,11 +392,12 @@ pub fn resolve_kvcache_budget_for_devices(
     let mut mamba_cache_budget_bytes = 0usize;
 
     if let Some(estimate) = estimate_hybrid_mamba_cache(model_config, model_dtype, num_shards) {
-        if let Some(plan) = plan_hybrid_mamba_cache(
+        if let Some(plan) = plan_hybrid_mamba_cache_with_fraction(
             detected * SIZE_IN_MB,
             estimate,
             min_active_slots,
             prefix_cache_enabled,
+            mamba_fraction,
         ) {
             let reserved_mamba_mb = plan.budget_bytes.div_ceil(SIZE_IN_MB);
             if reserved_mamba_mb < detected {
@@ -387,27 +457,58 @@ pub fn plan_hybrid_mamba_cache(
     min_active_slots: usize,
     prefix_cache_enabled: bool,
 ) -> Option<HybridMambaCachePlan> {
+    plan_hybrid_mamba_cache_with_fraction(
+        total_cache_budget_bytes,
+        estimate,
+        min_active_slots,
+        prefix_cache_enabled,
+        None,
+    )
+}
+
+pub fn plan_hybrid_mamba_cache_with_fraction(
+    total_cache_budget_bytes: usize,
+    estimate: HybridMambaCacheEstimate,
+    min_active_slots: usize,
+    prefix_cache_enabled: bool,
+    mamba_fraction: Option<f32>,
+) -> Option<HybridMambaCachePlan> {
     if total_cache_budget_bytes == 0 || estimate.slot_bytes == 0 {
         return None;
     }
+    let mamba_fraction = mamba_fraction
+        .unwrap_or(DEFAULT_HYBRID_MAMBA_FRACTION)
+        .clamp(0.0, MAX_HYBRID_MAMBA_FRACTION);
+    if mamba_fraction <= 0.0 {
+        return None;
+    }
 
-    let active_slot_capacity = min_active_slots.max(1);
-    let baseline_prefix_slots = if prefix_cache_enabled {
-        active_slot_capacity
+    let active_slot_target = if prefix_cache_enabled {
+        min_active_slots.max(HYBRID_MAMBA_MIN_ACTIVE_SLOTS)
+    } else {
+        min_active_slots.max(1)
+    };
+    let min_prefix_slot_target = if prefix_cache_enabled {
+        active_slot_target.saturating_mul(HYBRID_MAMBA_PREFIX_SLOT_MULTIPLIER)
     } else {
         0
     };
-    let baseline_budget_bytes = active_slot_capacity
-        .saturating_add(baseline_prefix_slots)
+    let baseline_budget_bytes = active_slot_target
+        .saturating_add(min_prefix_slot_target)
         .saturating_mul(estimate.slot_bytes);
-    let target_budget_bytes = ((total_cache_budget_bytes as f64)
-        * (DEFAULT_HYBRID_MAMBA_FRACTION as f64))
-        .round() as usize;
+    let target_budget_bytes =
+        ((total_cache_budget_bytes as f64) * (mamba_fraction as f64)).round() as usize;
     let budget_bytes = target_budget_bytes.max(baseline_budget_bytes);
     let total_slot_capacity = budget_bytes / estimate.slot_bytes;
-    let prefix_slot_capacity = if prefix_cache_enabled && total_slot_capacity > active_slot_capacity
-    {
-        total_slot_capacity - active_slot_capacity
+    let active_slot_capacity = if prefix_cache_enabled {
+        active_slot_target
+            .min(total_slot_capacity.saturating_sub(min_prefix_slot_target))
+            .max(1)
+    } else {
+        total_slot_capacity.max(1)
+    };
+    let prefix_slot_capacity = if prefix_cache_enabled {
+        total_slot_capacity.saturating_sub(active_slot_capacity)
     } else {
         0
     };
@@ -450,7 +551,10 @@ pub mod tools;
 
 #[cfg(test)]
 mod tests {
-    use super::compute_kvcache_budget_bytes;
+    use super::{
+        compute_kvcache_budget_bytes, plan_hybrid_mamba_cache_with_fraction,
+        HybridMambaCacheEstimate,
+    };
 
     #[test]
     fn test_compute_kvcache_budget_bytes() {
@@ -464,5 +568,33 @@ mod tests {
         let free = 0usize;
         let budget = compute_kvcache_budget_bytes(free, 0.9).unwrap();
         assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn test_hybrid_mamba_plan_keeps_two_prefix_slots_per_active_slot() {
+        let estimate = HybridMambaCacheEstimate {
+            slot_bytes: 10,
+            num_gdn_layers: 1,
+        };
+        let plan =
+            plan_hybrid_mamba_cache_with_fraction(1_000, estimate, 16, true, Some(0.15)).unwrap();
+
+        assert_eq!(plan.active_slot_capacity, 16);
+        assert_eq!(plan.prefix_slot_capacity, 32);
+        assert_eq!(plan.budget_bytes, 480);
+    }
+
+    #[test]
+    fn test_hybrid_mamba_plan_adds_fraction_leftover_to_prefix_slots() {
+        let estimate = HybridMambaCacheEstimate {
+            slot_bytes: 10,
+            num_gdn_layers: 1,
+        };
+        let plan =
+            plan_hybrid_mamba_cache_with_fraction(2_000, estimate, 16, true, Some(0.3)).unwrap();
+
+        assert_eq!(plan.active_slot_capacity, 16);
+        assert_eq!(plan.prefix_slot_capacity, 44);
+        assert_eq!(plan.budget_bytes, 600);
     }
 }

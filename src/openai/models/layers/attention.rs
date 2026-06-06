@@ -1,7 +1,7 @@
 use super::rotary_emb::ScalingRotaryEmbedding;
 use crate::openai::distributed::{
-    rms_norm_x, shard, Comm, MergedParallelColumnLinear, TensorParallelColumnLinear,
-    TensorParallelRowLinear, VarBuilder,
+    rms_norm_sharded, rms_norm_x, shard, Comm, MergedParallelColumnLinear,
+    TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
 };
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
 use crate::openai::models::Config;
@@ -36,6 +36,7 @@ pub struct Attention {
     dtype: DType,
     attn_output_gate: bool,
     no_per_head_norm: bool,
+    full_dim_qk_norm: bool,
     qk_l2_norm: bool,
     v_norm_eps: Option<f64>,
 }
@@ -363,6 +364,7 @@ impl Attention {
             comm,
             sliding_window,
             false,
+            false,
             None,
         )
     }
@@ -374,6 +376,7 @@ impl Attention {
         comm: Rc<Comm>,
         sliding_window: Option<usize>,
         k_eq_v: bool,
+        qk_l2_norm: bool,
         attention_scale: Option<f32>,
     ) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
@@ -479,23 +482,53 @@ impl Attention {
             &cfg.quantization_config,
         )?;
 
-        //we use higher precision for q/k norm
-        let q_norm = rms_norm_x(
+        let q_norm_perhead = rms_norm_x(
             head_dim,
             cfg.rms_norm_eps,
             vb.pp("q_norm"),
             DType::F32,
             qk_norm_add_one,
-        )
-        .ok();
-        let k_norm = rms_norm_x(
+        );
+        let k_norm_perhead = rms_norm_x(
             head_dim,
             cfg.rms_norm_eps,
             vb.pp("k_norm"),
             DType::F32,
             qk_norm_add_one,
-        )
-        .ok();
+        );
+
+        let (q_norm, k_norm, full_dim_qk_norm) = if q_norm_perhead.is_ok() && k_norm_perhead.is_ok()
+        {
+            (
+                Some(q_norm_perhead.unwrap()),
+                Some(k_norm_perhead.unwrap()),
+                false,
+            )
+        } else {
+            let q_shard = shard(0, comm.rank(), comm.world_size());
+            let kv_shard = shard(0, comm.rank(), comm.world_size());
+            let q_full = rms_norm_sharded(
+                num_heads * head_dim,
+                cfg.rms_norm_eps,
+                vb.pp("q_norm"),
+                DType::F32,
+                qk_norm_add_one,
+                q_shard,
+            );
+            let k_full = rms_norm_sharded(
+                num_kv_heads * head_dim,
+                cfg.rms_norm_eps,
+                vb.pp("k_norm"),
+                DType::F32,
+                qk_norm_add_one,
+                kv_shard,
+            );
+            if q_full.is_ok() && k_full.is_ok() {
+                (Some(q_full.unwrap()), Some(k_full.unwrap()), true)
+            } else {
+                (None, None, false)
+            }
+        };
 
         let is_gemma4 = arch == "Gemma4ForConditionalGeneration" || arch == "Gemma4ForCausalLM";
         let v_norm_eps = if is_gemma4 {
@@ -516,6 +549,7 @@ impl Attention {
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
             "Qwen3NextForConditionalGeneration",
+            "MiniMaxM2ForCausalLM",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -546,19 +580,16 @@ impl Attention {
                 sliding_window,
                 vb.device().clone(),
                 None,
-                cfg.fp8_kvcache.unwrap_or(false),
+                cfg.kvcache_dtype.is_fp8_keys(),
             )?,
             softcapping: cfg.attn_logit_softcapping,
             dtype: vb.dtype(),
             attn_output_gate,
             no_per_head_norm: no_per_head_norm_models.contains(&arch),
-            qk_l2_norm: false,
+            full_dim_qk_norm,
+            qk_l2_norm,
             v_norm_eps,
         })
-    }
-
-    pub fn set_qk_l2_norm(&mut self, enable: bool) {
-        self.qk_l2_norm = enable;
     }
 
     pub fn forward_ext(
@@ -620,8 +651,6 @@ impl Attention {
         let k = key_states.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
         let v = value_states.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
-        // Q/K norm weights are loaded in F32 for Qwen3.5/Next; cast activations
-        // to keep CUDA RMSNorm dtype-consistent.
         let (q, k) = if q.dtype() != DType::F32 {
             (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
         } else {
@@ -629,8 +658,15 @@ impl Attention {
         };
 
         let (q, k) = if let (Some(q_norm), Some(k_norm)) = (&self.q_norm, &self.k_norm) {
-            // Per‑head RMSNorm in qwen3
-            if self.no_per_head_norm {
+            if self.full_dim_qk_norm {
+                let q_2d = q.reshape((seq_len, self.num_heads * self.head_dim))?;
+                let k_2d = k.reshape((seq_len, self.num_kv_heads * self.head_dim))?;
+                let q_2d = q_norm.forward(&q_2d)?;
+                let k_2d = k_norm.forward(&k_2d)?;
+                let q = q_2d.reshape((seq_len, self.num_heads, self.head_dim))?;
+                let k = k_2d.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+                (q, k)
+            } else if self.no_per_head_norm {
                 let q = q_norm.forward(&q)?;
                 let k = k_norm.forward(&k)?;
                 (q, k)
@@ -850,7 +886,7 @@ impl QuantizedAttention {
                 sliding_window,
                 device.clone(),
                 None,
-                config.fp8_kvcache.unwrap_or(false),
+                config.kvcache_dtype.is_fp8_keys(),
             )?,
             rotary_emb: rotary_emb.clone(),
             dtype,

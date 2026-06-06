@@ -60,7 +60,7 @@ struct Args {
     verbose: bool,
 
     /// Maximum number of sequences to allow
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     max_num_seqs: usize,
 
     /// Size of a block
@@ -94,9 +94,13 @@ struct Args {
     kvcache_mem_gpu: usize,
 
     /// Auto-size GPU KV cache after model load using `fraction * remaining_gpu_mem`.
-    /// Defaults to 0.7 and takes priority over `--mem` on CUDA/Metal.
+    /// Defaults to 0.5 and takes priority over `--mem` on CUDA/Metal.
     #[arg(long)]
     gpu_memory_fraction: Option<f32>,
+
+    /// Fraction of the auto-sized combined cache budget reserved for hybrid Mamba/GDN states.
+    #[arg(long)]
+    mamba_fraction: Option<f32>,
 
     /// Available CPU memory for kvcache (MB)
     #[arg(long, default_value_t = 128)]
@@ -142,16 +146,21 @@ struct Args {
     #[arg(long)]
     prefill_chunk_size: Option<usize>,
 
-    #[arg(long, default_value_t = false)]
-    fp8_kvcache: bool,
+    /// KV cache dtype: auto (default), fp8, turbo8, turbo4, turbo3
+    #[arg(long)]
+    kvcache_dtype: Option<String>,
 
-    /// Enable prefix cache to reuse KV cache for repeated prompt prefixes.
+    /// Disable prefix cache (enabled by default).
     #[arg(long, default_value_t = false)]
-    prefix_cache: bool,
+    disable_prefix_cache: bool,
 
     /// Prefix cache size limit in tokens (rounded down to block size).
     #[arg(long)]
     prefix_cache_max_tokens: Option<usize>,
+
+    /// Disable CUDA graph capture (enabled by default on CUDA builds).
+    #[arg(long, default_value_t = false)]
+    disable_cuda_graph: bool,
 
     #[arg(long, default_value_t = false)]
     ui_server: bool, //start candle-vllm with built-in web server
@@ -301,14 +310,22 @@ async fn main() -> Result<()> {
     let (paths, gguf) = loader.prepare_model_weights(args.hf_token, args.hf_token_path)?;
 
     let dtype = candle_vllm::get_dtype(args.dtype);
-    let kv_cache_dtype = if args.fp8_kvcache { DType::U8 } else { dtype };
-
-    if cfg!(any(feature = "flashattn", feature = "flashinfer")) {
-        assert!(
-            !args.fp8_kvcache,
-            "fp8 kvcache is not compatible with `flashattn` or `flashinfer` features!"
-        );
-    }
+    let kvcache_dtype_enum = if let Some(ref s) = args.kvcache_dtype {
+        candle_vllm::openai::models::KvCacheDtype::from_str_opt(s).unwrap_or_else(|| {
+            panic!(
+                "Invalid --kvcache-dtype value: {}. Use auto/fp8/turbo8/turbo4/turbo3.",
+                s
+            )
+        })
+    } else {
+        candle_vllm::openai::models::KvCacheDtype::Auto
+    };
+    let kv_cache_dtype = if kvcache_dtype_enum.is_fp8_keys() {
+        DType::U8
+    } else {
+        dtype
+    };
+    candle_vllm::openai::models::KvCacheDtype::set_global(kvcache_dtype_enum);
 
     let device_ids: Vec<usize> = match args.device_ids {
         Some(ids) => ids,
@@ -479,8 +496,9 @@ async fn main() -> Result<()> {
         .expect("at least one pipeline must be loaded");
     let first_config = first_pipeline.get_model_config();
     let first_model_dtype = first_pipeline.dtype;
-    let requested_gpu_memory_fraction = args.gpu_memory_fraction.unwrap_or(0.7);
+    let requested_gpu_memory_fraction = args.gpu_memory_fraction.unwrap_or(0.5);
     let explicit_gpu_memory_fraction = args.gpu_memory_fraction.is_some();
+
     let (kvcache_mem_gpu, mamba_cache_budget_bytes, kvcache_budget_desc) =
         match candle_vllm::detect_kvcache_mem_gpu_mb_for_devices(
             &devices,
@@ -494,11 +512,12 @@ async fn main() -> Result<()> {
                     first_model_dtype,
                     num_shards,
                 ) {
-                    if let Some(plan) = candle_vllm::plan_hybrid_mamba_cache(
+                    if let Some(plan) = candle_vllm::plan_hybrid_mamba_cache_with_fraction(
                         detected * 1024 * 1024,
                         estimate,
-                        args.max_num_seqs.max(16),
-                        args.prefix_cache,
+                        args.max_num_seqs,
+                        !args.disable_prefix_cache,
+                        args.mamba_fraction,
                     ) {
                         let reserved_mamba_mb = plan.budget_bytes.div_ceil(1024 * 1024);
                         if reserved_mamba_mb < detected {
@@ -553,11 +572,12 @@ async fn main() -> Result<()> {
             let cfg = pipeline.get_model_config();
             let mut cache_cfg = candle_vllm::get_cache_config(
                 kvcache_mem_gpu,
-                args.kvcache_mem_cpu, //dummy 512MB for cpu
+                args.kvcache_mem_cpu,
                 block_size,
                 &cfg,
                 kv_cache_dtype,
                 num_shards,
+                kvcache_dtype_enum,
             );
             cache_cfg.mamba_cache_budget_bytes = mamba_cache_budget_bytes;
             let cache_engine = CacheEngine::new(
@@ -588,7 +608,7 @@ async fn main() -> Result<()> {
     } else {
         0
     };
-    let prefix_cache_max_blocks = if args.prefix_cache {
+    let prefix_cache_max_blocks = if !args.disable_prefix_cache {
         let max_blocks = args
             .prefix_cache_max_tokens
             .map(|tokens| tokens / cache_config.block_size)
@@ -598,7 +618,7 @@ async fn main() -> Result<()> {
         0
     };
     let prefix_cache_config = PrefixCacheConfig {
-        enabled: args.prefix_cache,
+        enabled: !args.disable_prefix_cache,
         max_cached_blocks: prefix_cache_max_blocks,
     };
 
@@ -607,6 +627,7 @@ async fn main() -> Result<()> {
         SchedulerConfig {
             max_num_seqs: args.max_num_seqs,
             prefix_cache: prefix_cache_config,
+            mamba_cache_capacity: None,
         },
         &cache_config,
         &config,
@@ -617,6 +638,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "nccl")]
         daemon_manager,
         args.prefill_chunk_size,
+        args.disable_cuda_graph,
     )?;
 
     if args.temperature.is_some() || pipeline_config.generation_cfg.is_none() {
@@ -795,7 +817,11 @@ async fn main() -> Result<()> {
                     } else {
                         vec!["text", "embedding"]
                     };
-                    (pipeline.name().to_string(), modalities, data.lora_manager.status())
+                    (
+                        pipeline.name().to_string(),
+                        modalities,
+                        data.lora_manager.status(),
+                    )
                 };
                 Json(json!({
                     "object": "list",

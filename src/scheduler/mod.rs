@@ -33,6 +33,9 @@ use self::{
     sequence::SequenceGroup,
 };
 
+const PREFIX_CACHE_PRESSURE_EVICT_PERCENT: f32 = 0.1; // evict 10% of prefix cache when under pressure
+const FINISHED_CACHED_TOKENS_MAX: usize = 16_384;
+
 pub struct SchedulerOutput {
     pub scheduled: Arc<VecDeque<Arc<SequenceGroup>>>,
     pub blocks_to_swap_in: HashMap<CPUBlockFrom, GPUBlockTo>,
@@ -56,6 +59,7 @@ pub struct SessionLookup {
 pub struct SchedulerConfig {
     pub max_num_seqs: usize,
     pub prefix_cache: PrefixCacheConfig,
+    pub mamba_cache_capacity: Option<usize>,
 }
 
 pub struct Scheduler {
@@ -66,6 +70,8 @@ pub struct Scheduler {
     pub block_engine: BlockEngine,
     mamba_state: MambaState,
     is_last_prefill: bool,
+    prefill_chunk_size: usize,
+    finished_cached_tokens: HashMap<usize, usize>,
 }
 
 impl Scheduler {
@@ -73,6 +79,7 @@ impl Scheduler {
         config: SchedulerConfig,
         cache_config: &CacheConfig,
         require_mamba_prefix_snapshots: bool,
+        prefill_chunk_size: usize,
     ) -> Self {
         assert!(cache_config.fully_init);
         let prefix_cache_cfg = config.prefix_cache.clone();
@@ -91,6 +98,8 @@ impl Scheduler {
             ),
             mamba_state: MambaState::default(),
             is_last_prefill: false,
+            prefill_chunk_size,
+            finished_cached_tokens: HashMap::new(),
         }
     }
 
@@ -105,27 +114,42 @@ impl Scheduler {
             let mut scheduled = VecDeque::new();
             let mut ignored_seq_groups = VecDeque::new();
             let mut blocks_to_copy = HashMap::new();
+            let pre_existing_running = self.running.len();
+
+            let max_seqs_limit = if let Some(mamba_cap) = self.config.mamba_cache_capacity {
+                if mamba_cap > 0 {
+                    mamba_cap
+                } else {
+                    self.config.max_num_seqs
+                }
+            } else {
+                self.config.max_num_seqs
+            };
+
             while !self.waiting.is_empty() {
-                if self.is_last_prefill && self.running.len() > 0 {
+                if self.is_last_prefill && pre_existing_running > 0 {
                     break; // interleaved scheduling
                 }
                 let seq_group = self.waiting.front().unwrap().clone();
 
-                // If adding this seq means we will have too many, stop as no more could be added.
-                if self.config.max_num_seqs
-                    == self
-                        .running
-                        .iter()
-                        .map(|group| group.get_seqs().len())
-                        .sum::<usize>()
-                        + 1
-                {
+                if self.running.len() >= max_seqs_limit {
+                    break;
+                }
+                let total_individual_seqs: usize = self
+                    .running
+                    .iter()
+                    .map(|group| group.get_seqs().len())
+                    .sum();
+                if total_individual_seqs + 1 > self.config.max_num_seqs {
                     break;
                 }
 
-                // If we cannot allocate either now or in the future, either do not continue or remove the sequence.
-                if seq_group.get_status() != SequenceStatus::Pending {
-                    let can_allocate = self.block_engine.can_allocate(&seq_group);
+                let has_block_table = self.block_engine.has_block_table(&seq_group);
+                if !has_block_table {
+                    // If we cannot allocate either now or in the future, either do not continue or remove the sequence.
+                    let can_allocate = self
+                        .block_engine
+                        .can_allocate_for_prefill(&seq_group, self.prefill_chunk_size);
                     match can_allocate {
                         AllocStatus::Later => break, //If we can only allocate later, do not bother iterating over the rest.
                         AllocStatus::Impossible => {
@@ -135,11 +159,14 @@ impl Scheduler {
                             );
                             seq_group.set_status(SequenceStatus::FinishedIgnored);
                             ignored_seq_groups.push_back(self.waiting.pop_front().unwrap());
+                            continue;
                         }
-                        _ => {}
+                        AllocStatus::Ok => {
+                            self._allocate(&seq_group, &mut blocks_to_copy);
+                        }
                     }
-
-                    self._allocate(&seq_group, &mut blocks_to_copy);
+                } else if !self.ensure_prefill_chunk_slots(&seq_group) {
+                    break;
                 }
 
                 seq_group.set_status(SequenceStatus::Running);
@@ -175,9 +202,26 @@ impl Scheduler {
         // Sorts by creation time, in descending order so that earliest are latest (first come first serve).
         self.sort_running_by_priority_fcfs();
 
+        let decode_max_seqs = if let Some(mamba_cap) = self.config.mamba_cache_capacity {
+            if mamba_cap > 0 {
+                std::cmp::min(mamba_cap, self.config.max_num_seqs)
+            } else {
+                self.config.max_num_seqs
+            }
+        } else {
+            self.config.max_num_seqs
+        };
+
         let mut running = VecDeque::new();
         let mut preempted = VecDeque::new();
         while !self.running.is_empty() {
+            if running.len() >= decode_max_seqs {
+                while let Some(excess) = self.running.pop_front() {
+                    self._preempt(excess.clone(), &mut blocks_to_swap_out);
+                    preempted.push_back(excess);
+                }
+                break;
+            }
             let seq_group = self.running.pop_front().unwrap();
             if seq_group.is_decode_blocked() {
                 running.push_back(seq_group);
@@ -185,6 +229,11 @@ impl Scheduler {
             }
             let mut finished_with_break = false;
             while !self.block_engine.can_append_token_to_seq(&seq_group) {
+                let evicted = self.evict_prefix_cache_under_pressure();
+                if evicted > 0 {
+                    warn!("Evicted {} prefix cache block(s) under pressure.", evicted);
+                    continue;
+                }
                 // If we cannot, now we need to preempt some seqs
                 if !self.running.is_empty() {
                     // There is something to preempt.
@@ -220,7 +269,16 @@ impl Scheduler {
 
                 // If the GPU cannot handle the group being swapped in, stop
                 if !self.block_engine.can_swap_in_seq_group(seq_group) {
-                    break;
+                    let required_blocks = self.block_engine.seq_group_block_count(seq_group);
+                    let evicted = self
+                        .block_engine
+                        .evict_prefix_cache_until_free(required_blocks);
+                    if evicted > 0 {
+                        warn!("Evicted {} prefix cache block(s) for swap-in.", evicted);
+                    }
+                    if !self.block_engine.can_swap_in_seq_group(seq_group) {
+                        break;
+                    }
                 }
 
                 let seq_group = self.swapped_out.pop_front().unwrap();
@@ -273,6 +331,7 @@ impl Scheduler {
         for group in to_free {
             for seq in group.get_seqs().values() {
                 let seq_id = seq.deref().get_id();
+                self.remember_finished_cached_tokens(seq_id, seq.deref().get_num_cached_tokens());
                 let full_blocks = seq.deref().get_len() / self.block_engine.get_block_size();
                 let block_id = self
                     .block_engine
@@ -288,8 +347,38 @@ impl Scheduler {
         released_ids
     }
 
+    pub fn get_num_cached_tokens_for_seq(&self, seq_id: usize) -> Option<usize> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.swapped_out.iter())
+            .find_map(|group| {
+                group
+                    .get_seqs()
+                    .values()
+                    .find(|seq| seq.deref().get_id() == seq_id)
+                    .map(|seq| seq.deref().get_num_cached_tokens())
+            })
+            .or_else(|| self.finished_cached_tokens.get(&seq_id).copied())
+    }
+
+    fn remember_finished_cached_tokens(&mut self, seq_id: usize, num_cached_tokens: usize) {
+        self.finished_cached_tokens
+            .insert(seq_id, num_cached_tokens);
+        while self.finished_cached_tokens.len() > FINISHED_CACHED_TOKENS_MAX {
+            let Some(oldest_seq_id) = self.finished_cached_tokens.keys().min().copied() else {
+                break;
+            };
+            self.finished_cached_tokens.remove(&oldest_seq_id);
+        }
+    }
+
     pub fn prefix_cache_enabled(&self) -> bool {
         self.block_engine.prefix_cache_enabled()
+    }
+
+    pub fn query_prefix_cache_match_tokens(&mut self, tokens: &[u32]) -> usize {
+        self.block_engine.query_prefix_cache_match_tokens(tokens)
     }
 
     pub fn print_free_blocks(&self) {
@@ -298,17 +387,29 @@ impl Scheduler {
         let kvcache_mem_size = self.block_engine.get_kvcache_mem_size() as f32 / 1024f32;
         let used_percent = (num_blocks - free_blocks) as f32 * 100f32 / num_blocks as f32;
         tracing::info!(
-            "Available {} KvCache tokens ({:.02}/{:.02}GB, used {:.02}%)",
-            free_blocks * self.block_engine.get_block_size(),
+            "GPU KvCache used {:.02}% ({:.02}/{:.02}GB, available {} KvCache tokens)",
             used_percent / 100f32 * kvcache_mem_size,
             kvcache_mem_size,
             used_percent,
+            free_blocks * self.block_engine.get_block_size(),
         );
     }
 
     pub fn get_available_kv_tokens(&self) -> usize {
         let free_blocks = self.block_engine.get_num_free_blocks();
         free_blocks * self.block_engine.get_block_size()
+    }
+
+    pub fn ensure_available_kv_tokens(&mut self, required_tokens: usize) -> (usize, usize) {
+        if required_tokens == 0 {
+            return (self.get_available_kv_tokens(), 0);
+        }
+
+        let required_blocks = required_tokens.div_ceil(self.block_engine.get_block_size());
+        let evicted = self
+            .block_engine
+            .evict_prefix_cache_until_free(required_blocks);
+        (self.get_available_kv_tokens(), evicted)
     }
 
     pub fn lookup_session(&self, request_id: &str) -> Option<SessionLookup> {
@@ -366,18 +467,17 @@ impl Scheduler {
     ) -> (Vec<u32>, VecDeque<Arc<SequenceGroup>>) {
         let mut finished_indices = Vec::new();
         let mut remove_ids = Vec::new();
+        let mut chunked_info = Vec::new();
+        let mut chunk_finished_info = Vec::new();
         assert!(chunk_size > 0, "Invalid prefill chunk size!");
         for (i, group) in scheduled.iter().enumerate() {
             let seq = group.get_seqs().values().nth(0).unwrap();
             let prompt_len = seq.deref().get_prompt_len();
             let num_cached_tokens = seq.deref().get_num_cached_tokens();
-            if prompt_len < chunk_size || num_cached_tokens + chunk_size >= prompt_len {
-                if prompt_len > chunk_size {
-                    tracing::info!(
-                        "Seq {} chunk prefill finished ({} tokens)",
-                        seq.deref().get_id(),
-                        prompt_len
-                    );
+            let remaining = prompt_len.saturating_sub(num_cached_tokens);
+            if remaining <= chunk_size {
+                if num_cached_tokens > 0 {
+                    chunk_finished_info.push((seq.deref().get_id(), prompt_len));
                 }
                 finished_indices.push(i as u32);
             } else {
@@ -388,14 +488,39 @@ impl Scheduler {
                 seq.deref_mut()
                     .set_num_cached_tokens(num_cached_tokens + chunk_size); //current prefilled CHUNK_SIZE
                 group.set_status(SequenceStatus::Pending);
-                tracing::info!(
-                    "Seq {} chunk prefilled {}/{} tokens",
+                chunked_info.push((
                     seq.deref().get_id(),
                     seq.deref().get_num_cached_tokens(),
-                    prompt_len
-                );
+                    prompt_len,
+                ));
                 self.waiting.push_back(group);
             }
+        }
+        if !chunked_info.is_empty() {
+            let total_chunked: usize = chunked_info.iter().map(|(_, cached, _)| *cached).sum();
+            let seq_details = chunked_info
+                .iter()
+                .map(|(id, cached, total)| format!("{}:{}/{}", id, cached, total))
+                .collect::<Vec<_>>();
+            tracing::info!(
+                "Chunk prefilled {} seq(s) [{}] ({} total tokens processed)",
+                chunked_info.len(),
+                seq_details.join(", "),
+                total_chunked
+            );
+        }
+        if !chunk_finished_info.is_empty() {
+            let seq_ids = chunk_finished_info
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            let total: usize = chunk_finished_info.iter().map(|(_, len)| *len).sum();
+            tracing::info!(
+                "Chunk prefill finished for {} seq(s) {:?} ({} total tokens)",
+                chunk_finished_info.len(),
+                seq_ids,
+                total
+            );
         }
         self.running.retain(|s| {
             !remove_ids.contains(&s.get_seqs().values().nth(0).unwrap().deref().get_id())
@@ -542,7 +667,8 @@ impl Scheduler {
         seq_group: &SequenceGroup,
         blocks_to_copy: &mut HashMap<usize, Vec<usize>>,
     ) {
-        self.block_engine.allocate(seq_group, blocks_to_copy)
+        self.block_engine
+            .allocate_for_prefill(seq_group, blocks_to_copy, self.prefill_chunk_size)
     }
 
     fn _free(&mut self, seq_group: &SequenceGroup, cache_prefix: bool) {
@@ -568,5 +694,41 @@ impl Scheduler {
             .make_contiguous()
             .sort_by_key(|seq_group| seq_group.arrival_time());
         self.swapped_out.make_contiguous().reverse();
+    }
+
+    fn evict_prefix_cache_under_pressure(&mut self) -> usize {
+        let cached_blocks = self.block_engine.prefix_cache_blocks();
+        if cached_blocks == 0 {
+            return 0;
+        }
+        let blocks = ((cached_blocks as f32) * PREFIX_CACHE_PRESSURE_EVICT_PERCENT).ceil() as usize;
+        let blocks = blocks.max(1);
+        self.block_engine.evict_prefix_cache_blocks(blocks)
+    }
+
+    fn ensure_prefill_chunk_slots(&mut self, seq_group: &SequenceGroup) -> bool {
+        let required_blocks = self
+            .block_engine
+            .prefill_chunk_blocks_required(seq_group, self.prefill_chunk_size);
+        if required_blocks > self.block_engine.get_num_free_blocks() {
+            let evicted = self
+                .block_engine
+                .evict_prefix_cache_until_free(required_blocks);
+            if evicted > 0 {
+                warn!(
+                    "Evicted {} prefix cache block(s) for prefill chunk.",
+                    evicted
+                );
+            }
+        }
+        if !self
+            .block_engine
+            .can_append_prefill_chunk_to_seq_group(seq_group, self.prefill_chunk_size)
+        {
+            return false;
+        }
+        self.block_engine
+            .append_prefill_chunk_slots_to_seq_group(seq_group, self.prefill_chunk_size);
+        true
     }
 }

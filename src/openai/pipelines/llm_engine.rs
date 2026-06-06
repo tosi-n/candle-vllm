@@ -9,6 +9,11 @@ mod streaming;
 #[path = "threaded.rs"]
 mod threaded;
 
+#[cfg(feature = "cuda")]
+const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 8;
+#[cfg(not(feature = "cuda"))]
+const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 4;
+
 #[cfg(feature = "nccl")]
 use crate::openai::communicator::DaemonManager;
 use crate::openai::pipelines::TokenOrFinishReason;
@@ -16,19 +21,22 @@ use crate::openai::streaming::ChatResponse;
 use crate::openai::TaskData;
 use crate::scheduler::Scheduler;
 use crate::tools::stream_parser::{
-    BufferedFinalizeResult, ParserState, StreamResult, StreamToolParser,
+    extract_reasoning_content, strip_reasoning_markers, BufferedFinalizeResult, ParserState,
+    StreamResult, StreamToolParser,
 };
 #[cfg(feature = "flashinfer")]
 use crate::FlashInferKvParams;
 use crate::{
     openai::{
+        conversation::default_conversation::DefaultConversation,
         models::Config,
         multimodal::compute_image_slice,
         multimodal::ImageData,
+        multimodal::ImageProcessConfig,
         responses::{
             ChatChoice, ChatChoiceData, ChatCompletionChunk, ChatCompletionUsageResponse, Choice,
-            ChoiceData, EmbeddingData, EmbeddingOutput, EmbeddingResponse, EmbeddingUsage,
-            WrapperLogprobs,
+            ChoiceData, CompletionTokensDetails, EmbeddingData, EmbeddingOutput, EmbeddingResponse,
+            EmbeddingUsage, PromptTokensDetails, WrapperLogprobs,
         },
         sampling_params::Logprobs,
         sampling_params::SamplingParams,
@@ -136,6 +144,10 @@ pub struct LLMEngine {
     pub exit_flag: Arc<AtomicBool>,
     last_decoding_throughput_log_ms: usize,
     prompt_replay_candidates: Vec<Vec<u32>>,
+    model_name: String,
+    tokenizer: tokenizers::Tokenizer,
+    conversation: DefaultConversation,
+    image_config: Option<ImageProcessConfig>,
 }
 
 impl LLMEngine {
@@ -618,7 +630,16 @@ impl LLMEngine {
         let tasks: Vec<_> = iterator
             .map(|rank| {
                 let engine_clone = engine.clone();
-                Self::generate_once(engine_clone, *rank, multi_process).unwrap()
+                match Self::generate_once(engine_clone, *rank, multi_process) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        warn!("Generation step failed on rank {}: {:?}", rank, err);
+                        if *rank == 0 {
+                            engine.write().fail_current_scheduled_groups(&err);
+                        }
+                        HashMap::new()
+                    }
+                }
             })
             .collect();
         tasks
@@ -651,8 +672,11 @@ impl LLMEngine {
         multi_process: bool,
         #[cfg(feature = "nccl")] daemon_manager: Option<DaemonManager>,
         prefill_chunk_size: Option<usize>,
+        disable_cuda_graph: bool,
     ) -> Result<Arc<RwLock<Self>>> {
-        const MIN_MAMBA_SLOT_CAPACITY: usize = 16;
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        let _ = disable_cuda_graph;
+
         let devices: Vec<_> = pipelines
             .values()
             .map(|(pipeline, _)| pipeline.device())
@@ -665,7 +689,10 @@ impl LLMEngine {
         let hybrid_mamba_estimate =
             crate::estimate_hybrid_mamba_cache(config, model_dtype, num_shards);
         let require_mamba_prefix_snapshots = hybrid_mamba_estimate.is_some();
-        let mut mamba_slot_capacity = scheduler_config.max_num_seqs.max(MIN_MAMBA_SLOT_CAPACITY);
+        let active_slot_target = scheduler_config
+            .max_num_seqs
+            .max(HYBRID_MAMBA_MIN_ACTIVE_SLOTS);
+        let mut mamba_slot_capacity = active_slot_target;
         let mut mamba_prefix_capacity = Self::effective_mamba_prefix_capacity(
             scheduler_config.prefix_cache.enabled,
             mamba_slot_capacity,
@@ -698,33 +725,24 @@ impl LLMEngine {
             if cache_config.mamba_cache_budget_bytes > 0 {
                 let planned_total_slots =
                     cache_config.mamba_cache_budget_bytes / estimate.slot_bytes;
-                if planned_total_slots >= mamba_slot_capacity {
+                if planned_total_slots > 0 {
+                    mamba_slot_capacity = if scheduler_config.prefix_cache.enabled {
+                        active_slot_target.min(planned_total_slots).max(1)
+                    } else {
+                        planned_total_slots
+                    };
                     let prefix_budget_slots =
                         planned_total_slots.saturating_sub(mamba_slot_capacity);
-                    if prefix_budget_slots == 0 && mamba_prefix_capacity > 0 {
-                        info!(
-                            "Hybrid mamba planned budget leaves 0 explicit snapshot slot(s); using auto prefix-state capacity {}.",
-                            mamba_prefix_capacity
-                        );
-                    } else if mamba_prefix_capacity > prefix_budget_slots {
+                    mamba_prefix_capacity = if scheduler_config.prefix_cache.enabled {
+                        prefix_budget_slots
+                    } else {
+                        0
+                    };
+                    if mamba_prefix_capacity == 0 && scheduler_config.prefix_cache.enabled {
                         warn!(
-                            "Capping hybrid mamba prefix-state cache from {} to {} entries by planned budget.",
-                            mamba_prefix_capacity,
-                            prefix_budget_slots
+                            "Hybrid mamba prefix-state cache disabled because the planned mamba budget leaves no snapshot slots after active slots."
                         );
-                        mamba_prefix_capacity = prefix_budget_slots;
                     }
-                } else if planned_total_slots > 0 {
-                    warn!(
-                        "Hybrid mamba planned budget only fits {} total slot(s), below the target active minimum {}; using the largest safe active capacity instead.",
-                        planned_total_slots,
-                        mamba_slot_capacity
-                    );
-                    mamba_slot_capacity = planned_total_slots;
-                    mamba_prefix_capacity = Self::effective_mamba_prefix_capacity(
-                        scheduler_config.prefix_cache.enabled,
-                        mamba_slot_capacity,
-                    );
                 } else {
                     warn!(
                         "Hybrid mamba planned budget is smaller than one slot; falling back to 1 active slot."
@@ -772,15 +790,35 @@ impl LLMEngine {
         for (pipeline, _) in pipelines.values_mut() {
             pipeline.preallocate_mamba_cache(mamba_slot_capacity)?;
             pipeline.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            pipeline.clamp_mamba_graph_capture_batches(mamba_slot_capacity);
+        }
+
+        let mut scheduler_config = scheduler_config;
+        if require_mamba_prefix_snapshots && mamba_slot_capacity > 0 {
+            scheduler_config.mamba_cache_capacity = Some(mamba_slot_capacity);
         }
 
         let num_threads: usize = pipelines.len();
+        let (model_name, tokenizer, conversation, image_config) = {
+            let (pipeline, _) = pipelines
+                .values()
+                .next()
+                .expect("LLMEngine requires at least one pipeline");
+            (
+                pipeline.name().to_string(),
+                pipeline.tokenizer.clone(),
+                pipeline.conversation.clone(),
+                pipeline.image_config.clone(),
+            )
+        };
         let engine = Arc::new(RwLock::new(Self {
             pipelines,
             scheduler: Scheduler::new(
                 scheduler_config,
                 cache_config,
                 require_mamba_prefix_snapshots,
+                prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE),
             ),
             seq_id: 0,
             cache_config: cache_config.clone(),
@@ -801,6 +839,10 @@ impl LLMEngine {
             exit_flag: Arc::new(AtomicBool::new(false)),
             last_decoding_throughput_log_ms: 0,
             prompt_replay_candidates: Vec::new(),
+            model_name,
+            tokenizer,
+            conversation,
+            image_config,
         }));
         {
             let mut e = engine.write();
@@ -824,18 +866,23 @@ impl LLMEngine {
             tokio::runtime::Handle::current().block_on(async move {
                 #[cfg(all(feature = "cuda", feature = "graph"))]
                 {
-                    let graph_capture_result = {
-                        let mut e = engine.write();
-                        e.graph_capture_all_pipelines()
-                    };
-                    let _ = graph_capture_tx.send(
-                        graph_capture_result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|e| format!("{e:?}")),
-                    );
-                    if graph_capture_result.is_err() {
-                        return;
+                    if disable_cuda_graph {
+                        tracing::warn!("CUDA graph capture disabled by --disable-cuda-graph");
+                        let _ = graph_capture_tx.send(Ok(()));
+                    } else {
+                        let graph_capture_result = {
+                            let mut e = engine.write();
+                            e.graph_capture_all_pipelines()
+                        };
+                        let _ = graph_capture_tx.send(
+                            graph_capture_result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(|e| format!("{e:?}")),
+                        );
+                        if graph_capture_result.is_err() {
+                            return;
+                        }
                     }
                 }
                 loop {
@@ -874,12 +921,25 @@ impl LLMEngine {
                     if multi_process && !is_master_rank {
                         continue;
                     }
+                    if results.is_empty() {
+                        continue;
+                    }
                     let result = &results[0];
-                    if results.is_empty() || result.is_empty() {
+                    if result.is_empty() {
                         continue;
                     }
 
                     //chat completion statistics
+                    let cached_tokens_total = result
+                        .values()
+                        .filter_map(|(_, usage)| usage.prompt_tokens_details.as_ref())
+                        .map(|details| details.cached_tokens)
+                        .sum();
+                    let reasoning_tokens_total = result
+                        .values()
+                        .filter_map(|(_, usage)| usage.completion_tokens_details.as_ref())
+                        .map(|details| details.reasoning_tokens)
+                        .sum();
                     let overall_usage = ChatCompletionUsageResponse {
                         request_id: "".to_string(),
                         created: 0,
@@ -898,6 +958,15 @@ impl LLMEngine {
                             .map(|(_, usage)| usage.completion_time_costs)
                             .max()
                             .unwrap_or(0),
+                        prompt_tokens_details: (cached_tokens_total > 0)
+                            .then_some(PromptTokensDetails {
+                                cached_tokens: cached_tokens_total,
+                            }),
+                        completion_tokens_details: (reasoning_tokens_total > 0).then_some(
+                            CompletionTokensDetails {
+                                reasoning_tokens: reasoning_tokens_total,
+                            },
+                        ),
                     };
 
                     let prompt_tps : f32 = result.values().map(|(_, usage)| {
@@ -992,11 +1061,6 @@ impl LLMEngine {
                 seq_group.active_reasoning_end = task.prefilled_reasoning_end.clone();
             }
             if let Some(replay_ids) = self.match_prompt_replay_candidate(&task.prompt) {
-                tracing::info!(
-                    "Matched prompt replay candidate ({} token(s)) for group {}",
-                    replay_ids.len(),
-                    task.group_id
-                );
                 seq_group.prompt_replay_token_ids = Some(replay_ids);
             }
             tracing::debug!("Main process: add_sequence to group {}", task.group_id);
@@ -1016,6 +1080,22 @@ impl LLMEngine {
         rank: usize,
     ) -> Option<&mut (Box<DefaultPipeline>, CacheEngine)> {
         self.pipelines.get_mut(&rank)
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.tokenizer
+    }
+
+    pub fn conversation(&self) -> DefaultConversation {
+        self.conversation.clone()
+    }
+
+    pub fn image_config(&self) -> Option<ImageProcessConfig> {
+        self.image_config.clone()
     }
 
     /// Build prompt-replay candidates from the chat template.  Each candidate
@@ -1168,6 +1248,9 @@ impl LLMEngine {
 
     #[cfg(feature = "flashinfer")]
     fn flashinfer_kv_params_for_rank(&self, rank: usize) -> Result<Option<FlashInferKvParams>> {
+        if attention_rs::get_turboquant_mode().is_some() {
+            return Ok(None);
+        }
         let (_, cache_engine) = self
             .get_pipeline(rank)
             .ok_or_else(|| candle_core::Error::msg(format!("missing pipeline for rank {rank}")))?;
@@ -1177,10 +1260,6 @@ impl LLMEngine {
         }
 
         let (k_cache, _) = &kv_cache[0];
-        if k_cache.dtype() == candle_core::DType::U8 {
-            return Ok(None);
-        }
-
         let (_, page_size, num_kv_heads, head_dim) = k_cache.dims4()?;
         Ok(Some(FlashInferKvParams {
             kv_dtype: k_cache.dtype(),
@@ -1293,6 +1372,66 @@ impl LLMEngine {
         self.scheduler.has_unfinished_sequences()
     }
 
+    fn count_text_tokens(pipeline: &DefaultPipeline, text: &str) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        pipeline
+            .tokenizer()
+            .encode(text, false)
+            .map(|encoding| encoding.get_ids().len())
+            .unwrap_or(0)
+    }
+
+    fn reasoning_token_count_for_sequence(
+        &self,
+        pipeline: &DefaultPipeline,
+        group: &SequenceGroup,
+        seq: &Arc<Sequence>,
+    ) -> usize {
+        let outputs = seq.deref().get_output_tokens();
+        if outputs.is_empty() {
+            return 0;
+        }
+
+        let raw_output = outputs.iter().map(|x| x.bytes.as_str()).collect::<String>();
+        if let Some((reasoning, _)) = extract_reasoning_content(&raw_output) {
+            return Self::count_text_tokens(pipeline, &reasoning);
+        }
+
+        let should_parse_tools = group.sampling_params.mcp_mode.is_some();
+        if !(crate::stream_as_reasoning_content() && should_parse_tools) {
+            return 0;
+        }
+
+        let mut parser = StreamToolParser::new_with_config(
+            &pipeline.tool_model_type,
+            pipeline.tool_parser_model_id.clone(),
+            pipeline.tool_config.clone(),
+            group.tools.clone(),
+            pipeline.enforce_parser.clone(),
+        );
+        if group.active_reasoning_end.is_some() {
+            parser.set_initial_reasoning_end_marker(group.active_reasoning_end.clone());
+        }
+        parser.set_detect_tools_in_reasoning(true);
+
+        let mut reasoning_text = String::new();
+        for output in outputs {
+            let was_in_reasoning = parser.in_reasoning();
+            match parser.process_token(output.token, &output.bytes) {
+                StreamResult::Content(text) | StreamResult::FlushBuffer(text) => {
+                    if was_in_reasoning {
+                        reasoning_text.push_str(&strip_reasoning_markers(&text));
+                    }
+                }
+                StreamResult::Buffering | StreamResult::ToolCalls(_) => {}
+            }
+        }
+
+        Self::count_text_tokens(pipeline, &reasoning_text)
+    }
+
     fn schedule_current_batch(&mut self, rank: usize) -> Result<()> {
         let scheduler_outputs = self.scheduler.schedule();
         if !scheduler_outputs.ignored_seq_groups.is_empty() {
@@ -1335,89 +1474,167 @@ impl LLMEngine {
         self.sequence_groups.write().clear();
     }
 
+    fn selected_adapter_for_group(group: &Arc<SequenceGroup>) -> Option<String> {
+        let seq = Self::primary_sequence(group);
+        if seq.deref().needs_prefill() {
+            group.adapter_id.clone()
+        } else {
+            group.resolve_decode_adapter_id()
+        }
+    }
+
+    fn select_adapter_for_batch(
+        scheduled: &VecDeque<Arc<SequenceGroup>>,
+    ) -> Result<Option<String>> {
+        let Some(first_group) = scheduled.front() else {
+            return Ok(None);
+        };
+        let selected = Self::selected_adapter_for_group(first_group);
+        for group in scheduled.iter().skip(1) {
+            let current = Self::selected_adapter_for_group(group);
+            if current != selected {
+                candle_core::bail!(
+                    "LoRA adapter batch must be homogeneous; request '{}' uses {:?}, request '{}' uses {:?}",
+                    first_group.request_id,
+                    selected,
+                    group.request_id,
+                    current
+                );
+            }
+        }
+        Ok(selected)
+    }
+
+    fn fail_current_scheduled_groups(&mut self, err: &candle_core::Error) {
+        let scheduled = self.sequence_groups.read().clone();
+        if scheduled.is_empty() {
+            return;
+        }
+
+        let message = format!("Generation failed: {err:?}");
+        let seq_ids = scheduled
+            .iter()
+            .map(|group| Self::primary_sequence(group).deref().get_id())
+            .collect::<Vec<_>>();
+
+        for group in &scheduled {
+            if let Some(sender) = &group.sender {
+                let _ = sender.send(ChatResponse::ModelError(message.clone()));
+                let _ = sender.send(ChatResponse::Done);
+            }
+        }
+
+        let aborted = self.scheduler.abort_sequences(&seq_ids);
+        warn!(
+            "Aborted {} scheduled sequence(s) after generation failure: {:?}",
+            aborted.len(),
+            aborted
+        );
+        self.sequence_groups.write().clear();
+    }
+
     fn execute_scheduled_batch(
-        &mut self,
+        engine: &Arc<RwLock<Self>>,
         scheduled: &VecDeque<Arc<SequenceGroup>>,
         rank: usize,
     ) -> Result<BatchExecution> {
-        let is_embedding = scheduled[0].is_embedding;
-        let is_prompt_request = Self::primary_sequence(&scheduled[0]).deref().is_prompt();
+        let selected_adapter_id = Self::select_adapter_for_batch(scheduled)?;
+        let (pipeline_entry, tokens, positions, metadata, images, is_embedding, model_name) = {
+            let mut guard = engine.write();
+            let is_embedding = scheduled[0].is_embedding;
+            let is_prompt_request = Self::primary_sequence(&scheduled[0]).deref().is_prompt();
 
-        if is_prompt_request {
-            self.restore_mamba_prefix_states_for_prompt(scheduled, rank)?;
-        }
-
-        let (pipeline, cache_engine) = self.get_pipeline(rank).unwrap();
-        let device = pipeline.device();
-        let model_name = pipeline.name().to_string();
-        #[cfg_attr(not(feature = "flashinfer"), allow(unused_mut))]
-        let mut prepared = if is_prompt_request {
-            self.prepare_prompt(scheduled, device, rank)
-        } else {
-            self.prepare_decode(scheduled, device, rank)
-        }?;
-        #[cfg(feature = "flashinfer")]
-        if !prepared.metadata.is_prefill {
-            let use_cuda_graph = prepared
-                .metadata
-                .flashinfer_metadata
-                .as_ref()
-                .map(|fm| fm.use_cuda_graph)
-                .unwrap_or(false);
-            if !use_cuda_graph {
-                self.ensure_flashinfer_decode_plan(
-                    rank,
-                    device,
-                    prepared.tokens.dim(0)?,
-                    &mut prepared.metadata,
-                )?;
+            if is_prompt_request {
+                guard.restore_mamba_prefix_states_for_prompt(scheduled, rank)?;
             }
-        }
-        let PreparedInputs {
-            tokens,
-            positions,
-            metadata,
-        } = prepared;
 
-        let images: Option<ImageData> = if is_prompt_request {
-            let seq = Self::primary_sequence(&scheduled[0]);
-            let seq_guard = seq.deref();
-            let seq_images = seq_guard.get_images();
-            let seq_token_ids = seq_guard.get_token_ids();
-            let seq_num_cached_tokens = seq_guard.get_num_cached_tokens();
-            drop(seq_guard);
-            if let Some(images) = seq_images {
-                if scheduled.len() > 1 {
-                    candle_core::bail!(
-                        "multimodal prefill does not support batching multiple sequence groups"
-                    );
+            let (pipeline, _) = guard.get_pipeline(rank).unwrap();
+            let device = pipeline.device();
+            let model_name = pipeline.name().to_string();
+            #[cfg_attr(not(feature = "flashinfer"), allow(unused_mut))]
+            let mut prepared = if is_prompt_request {
+                guard.prepare_prompt(scheduled, device, rank)
+            } else {
+                guard.prepare_decode(scheduled, device, rank)
+            }?;
+            #[cfg(feature = "flashinfer")]
+            if !prepared.metadata.is_prefill {
+                let use_cuda_graph = prepared
+                    .metadata
+                    .flashinfer_metadata
+                    .as_ref()
+                    .map(|fm| fm.use_cuda_graph)
+                    .unwrap_or(false);
+                if !use_cuda_graph {
+                    guard.ensure_flashinfer_decode_plan(
+                        rank,
+                        device,
+                        prepared.tokens.dim(0)?,
+                        &mut prepared.metadata,
+                    )?;
                 }
-                if images.image_idx == -1 {
-                    None
+            }
+            let PreparedInputs {
+                tokens,
+                positions,
+                metadata,
+            } = prepared;
+
+            let images: Option<ImageData> = if is_prompt_request {
+                let seq = Self::primary_sequence(&scheduled[0]);
+                let seq_guard = seq.deref();
+                let seq_images = seq_guard.get_images();
+                let seq_token_ids = seq_guard.get_token_ids();
+                let seq_num_cached_tokens = seq_guard.get_num_cached_tokens();
+                drop(seq_guard);
+                if let Some(images) = seq_images {
+                    if scheduled.len() > 1 {
+                        candle_core::bail!(
+                            "multimodal prefill does not support batching multiple sequence groups"
+                        );
+                    }
+                    if images.image_idx == -1 {
+                        None
+                    } else {
+                        compute_image_slice(&seq_token_ids, seq_num_cached_tokens, &images).map(
+                            |(image_idx, token_offset)| {
+                                let mut images = images.clone();
+                                images.image_idx = image_idx;
+                                images.image_token_offset = token_offset;
+                                images
+                            },
+                        )
+                    }
                 } else {
-                    compute_image_slice(&seq_token_ids, seq_num_cached_tokens, &images).map(
-                        |(image_idx, token_offset)| {
-                            let mut images = images.clone();
-                            images.image_idx = image_idx;
-                            images.image_token_offset = token_offset;
-                            images
-                        },
-                    )
+                    None
                 }
             } else {
                 None
-            }
-        } else {
-            None
+            };
+
+            let pipeline_entry = guard.pipelines.remove(&rank).ok_or_else(|| {
+                candle_core::Error::msg(format!("missing pipeline for rank {rank}"))
+            })?;
+            (
+                pipeline_entry,
+                tokens,
+                positions,
+                metadata,
+                images,
+                is_embedding,
+                model_name,
+            )
         };
 
+        let (pipeline, cache_engine) = (&pipeline_entry.0, &pipeline_entry.1);
+        crate::openai::lora::set_active_adapter(selected_adapter_id.clone());
         let logits = if is_embedding {
             pipeline.forward_embedding(
                 tokens,
                 &positions,
                 Some(&cache_engine.get_kv_cache()),
                 &metadata,
-            )?
+            )
         } else {
             pipeline.forward(
                 tokens,
@@ -1425,8 +1642,21 @@ impl LLMEngine {
                 Some(&cache_engine.get_kv_cache()),
                 &metadata,
                 images.as_ref(),
-            )?
+            )
         };
+        crate::openai::lora::clear_active_adapter();
+        let mut guard = engine.write();
+        if guard.pipelines.insert(rank, pipeline_entry).is_some() {
+            candle_core::bail!("pipeline for rank {rank} was replaced while detached");
+        }
+        let logits = logits?;
+
+        if let Some(adapter_id) = selected_adapter_id.as_deref() {
+            if let Some(manager) = crate::openai::lora::global_lora_manager_for_adapter(adapter_id)
+            {
+                manager.touch_usage(adapter_id);
+            }
+        }
 
         Ok(BatchExecution {
             logits,
@@ -1699,9 +1929,9 @@ impl LLMEngine {
 
                 let mut choices = Vec::new();
                 let do_sync_response = allow_sync_response && group.sender.is_none();
+                let pipeline = self.get_pipeline(0usize).unwrap().0.as_ref();
 
                 if do_sync_response {
-                    let pipeline = self.get_pipeline(0usize).unwrap().0.as_ref();
                     for (index, seq) in top_n.iter().enumerate() {
                         let outputs = seq.deref_mut().get_output_tokens();
                         let should_parse_tools = group.sampling_params.mcp_mode.is_some();
@@ -1854,24 +2084,20 @@ impl LLMEngine {
                         // Extract reasoning from the full accumulated output
                         // so it is available even when tool calls consumed
                         // the content (setting it to None).
-                        let reasoning_content =
-                            if crate::stream_as_reasoning_content() && should_parse_tools {
-                                if !full_accumulated.is_empty() {
-                                    crate::tools::stream_parser::extract_reasoning_content(
-                                        &full_accumulated,
-                                    )
-                                    .map(|(r, _)| r)
-                                } else {
-                                    None
-                                }
+                        let reasoning_content = if crate::stream_as_reasoning_content() {
+                            if !full_accumulated.is_empty() {
+                                crate::tools::stream_parser::extract_reasoning_content(
+                                    &full_accumulated,
+                                )
+                                .map(|(r, _)| r)
                             } else {
                                 None
-                            };
+                            }
+                        } else {
+                            None
+                        };
 
-                        let content = if crate::stream_as_reasoning_content()
-                            && should_parse_tools
-                            && content.is_some()
-                        {
+                        let content = if crate::stream_as_reasoning_content() && content.is_some() {
                             match content {
                                 Some(text) => {
                                     match crate::tools::stream_parser::extract_reasoning_content(
@@ -1924,6 +2150,14 @@ impl LLMEngine {
                     .duration_since(group.created_time)
                     .unwrap()
                     .as_millis();
+                let cached_tokens = top_n
+                    .first()
+                    .and_then(|seq| self.get_num_cached_tokens_for_seq(seq.deref().get_id()))
+                    .unwrap_or_else(|| top_n.first().unwrap().deref().get_num_cached_tokens());
+                let reasoning_tokens = top_n
+                    .iter()
+                    .map(|seq| self.reasoning_token_count_for_sequence(pipeline, group, seq))
+                    .sum::<usize>();
 
                 let usage = ChatCompletionUsageResponse {
                     request_id: group.request_id.clone(),
@@ -1933,6 +2167,10 @@ impl LLMEngine {
                     total_tokens: completion_tokens + prompt_tokens,
                     prompt_time_costs: prompt_time_costs as usize,
                     completion_time_costs: completion_time_costs as usize,
+                    prompt_tokens_details: (cached_tokens > 0)
+                        .then_some(PromptTokensDetails { cached_tokens }),
+                    completion_tokens_details: (reasoning_tokens > 0)
+                        .then_some(CompletionTokensDetails { reasoning_tokens }),
                 };
 
                 responses.insert(group.request_id.clone(), (choices, usage.clone()));
@@ -2154,6 +2392,18 @@ impl LLMEngine {
 
     pub fn get_available_kv_tokens(&self) -> usize {
         self.scheduler.get_available_kv_tokens()
+    }
+
+    pub fn ensure_available_kv_tokens(&mut self, required_tokens: usize) -> (usize, usize) {
+        self.scheduler.ensure_available_kv_tokens(required_tokens)
+    }
+
+    pub fn query_prefix_cache_match_tokens(&mut self, tokens: &[u32]) -> usize {
+        self.scheduler.query_prefix_cache_match_tokens(tokens)
+    }
+
+    pub fn get_num_cached_tokens_for_seq(&self, seq_id: usize) -> Option<usize> {
+        self.scheduler.get_num_cached_tokens_for_seq(seq_id)
     }
 
     pub fn get_session_lookup(&self, request_id: &str) -> Option<crate::scheduler::SessionLookup> {

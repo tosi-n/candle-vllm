@@ -1,6 +1,6 @@
 [package]
 name = "candle-vllm"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 default-run = "candle-vllm"
 
@@ -22,8 +22,8 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "b63bf40" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "b63bf40" }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "68b6d74" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "68b6d74" }
 dyn-fmt = "0.4.0"
 safetensors = "0.4"
 serde = { version = "1.0.190", features = ["serde_derive"] }
@@ -49,7 +49,7 @@ dirs = "5.0.1"
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
 thiserror = "1.0.58"
-attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", version="0.5.2", rev = "79d2579" }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", version="0.5.7", rev = "a0fe7ef" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 lazy_static = {version = "1.4.0"}
 interprocess = "2.2.2"
@@ -67,13 +67,13 @@ itertools = "0.13.0"
 chrono = "0.4.41"
 which = "8.0.0"
 ahash = "0.8.11"
-rustchatui = { git = "https://github.com/guoqingbao/rustchatui.git", rev="68caad9" }
+rustchatui = "0.3.0"
 base64 = "0.22.1"
 bytes = "1.5"
 reqwest = { version = "0.12.24", features = ["blocking", "json", "rustls-tls"]}
 regex = "1.12.2"
-tool-parser = "1.1.1"
-openai-protocol = "1.2.0"
+tool-parser = "1.2.0"
+openai-protocol = "1.6.0"
 crossbeam = "0.8.4"
 colored = { version = "3.0.0" }
 local-ip-address = "0.6.5"
@@ -83,18 +83,19 @@ libc = "0.2.184"
 
 [features]
 accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "attention-rs/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "attention-rs/cuda", "graph"]
 cutlass = ["cuda", "attention-rs/cutlass"]
+flash = ["attention-rs/flash"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal", "attention-rs/metal"]
 cudnn = ["candle-core/cudnn"]
-flashattn = ["attention-rs/flashattn", "attention-rs/no-fp8-kvcache"]
+flashattn = ["attention-rs/flashattn"]
 flashinfer = ["attention-rs/flashinfer"]
 trtllm = ["flashinfer", "attention-rs/trtllm"]
 flash-decoding = []
 mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl"]
 nccl = ["candle-core/nccl"]
 mpi = ["candle-core/nccl", "dep:mpi"]
-graph = ["attention-rs/graph", "candle-core/graph"]
+graph = ["flash", "attention-rs/graph", "candle-core/graph"]
 
 [dev-dependencies]
 tempfile = "3.26.0"

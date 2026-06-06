@@ -1,5 +1,5 @@
 use super::rotary_emb::ScalingRotaryEmbedding;
-use super::{attention::QuantizedAttention, Config, Qwen3HybridConfig};
+use super::{attention::QuantizedAttention, Config, KvCacheDtype, Qwen3HybridConfig};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
 use crate::openai::models::mask::get_attention_causal_mask;
@@ -404,7 +404,7 @@ impl QuantizedGatedDeltaNet {
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            xs.device().synchronize()?;
+            // xs.device().synchronize()?;
             gdn::gated_delta_rule_recurrence_varlen(
                 &q_scaled,
                 &k,
@@ -578,7 +578,7 @@ impl GGUFQWen3_5 {
         max_seq_len: usize,
         original_max_position_embeddings: Option<usize>,
         partial_rotary_factor: Option<f32>,
-        kv_cache_dtype: DType,
+        _kv_cache_dtype: DType,
         extra_config_json: Option<String>,
     ) -> Config {
         Config {
@@ -614,7 +614,7 @@ impl GGUFQWen3_5 {
             quantization_config: None,
             moe_config: None,
             isq_quant: None,
-            fp8_kvcache: Some(kv_cache_dtype == DType::U8),
+            kvcache_dtype: KvCacheDtype::Auto,
             extra_config_json,
         }
     }

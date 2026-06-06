@@ -24,6 +24,8 @@
 - 支持CUDA Graph
 - 支持Prefix Caching
 - 支持硬件FP8模型推理加速（SM90+, Qwen3系列，Block-wise FP8量化）
+- 支持 FP8 KV Cache（兼容 FlashInfer、FlashAttention 及 Prefix Cache，适用于所有 CUDA 和 Metal 平台）
+- 支持 TurboQuant KV Cache（turbo8/turbo4/turbo3），使用原生 Flash 注意力内核实现高压缩比 KV 缓存
 - 支持 Flashinfer 后端
 - 支持通过命令行参数 `--yarn-scaling-factor` 手动设置 YaRN RoPE 缩放因子
 - 支持 MXFP4/NVFP4 模型
@@ -33,7 +35,7 @@
   <details open>
     <summary>显示支持的模型架构</summary>
 
-    | 模型ID | 模型类型 | 解码速度 / 单请求（`BF16`, Hopper） | 量化（`Q4K`或`Marlin`） |
+    | 模型ID | 模型类型 | 解码速度 / 单请求（`BF16`) | 量化（`Q4K`或`Marlin`） |
     |--|--|--|--|
     | #1 | **LLAMA** |105 tks/s (8B) | 154 tks/s (8B, Q4k), 163 tks/s (8B, **Marlin**) |
     | #2 | **Mistral** |112 tks/s (7B)| 171 tks/s (7B, Q4k), 175 tks/s (7B, **Marlin**) |
@@ -41,8 +43,8 @@
     | #4 | **QWen2/Qwen3 Dense** |96 tks/s (8B)|135 tks/s **(8B, Q4k)**|
     | #5 | **QWen3 MoE** |92 tks/s **(30B)**|114 tks/s **(30B, Q4K)** |
     | #6 | **QWen3-Next MoE** |71 tks/s **(80B, BF16, tp=2)**|TBD|
-    | #7 | **QWen3.5 Dense** |30 tks/s **(27B, BF16)**|~42 tks/s **(27B, Q4K / FP8)** |
-    | #8 | **QWen3.5 MoE** |82 tks/s **(35B)**|93 tks/s **(35B, Q4K)** |
+    | #7 | **QWen3.5/3.6 Dense** |30 tks/s **(27B, BF16)**|~42 tks/s **(27B, Q4K / FP8)** |
+    | #8 | **QWen3.5/3.6 MoE** |82 tks/s **(35B)**|93 tks/s **(35B, Q4K)** |
     | #9 | **Yi** |148 tks/s (6B)| 180 tks/s (6B, Q4k)|
     | #10 | **StableLM** |223 tks/s (3B)|-|
     | #11 | **Gemma-2/Gemma-3** |92 tks/s (9B)|115 tks/s (9B, **Marlin**)|
@@ -51,7 +53,10 @@
     | #14 | **GLM4** |89 tks/s **(9B)**|124 tks/s **(9B, Q4K)**|
     | #15 | **GLM4.7 Flash** |TBD|75 tks/s **(31B, NVFP4)**|
     | #16 | **LLama4** |TBD|43 tks/s **(107B, NVFP4)**|
-    | #17 | **Gemma4-26B** |75 tks/s|72 tks/s **(NVFP4)**|
+    | #17 | **Gemma4** |(26B) 75 tks/s|72 tks/s **(26B, NVFP4)**|
+    | #18 | **MiniMax-M2.5/M2.7** |TBD|60 tks/s **(229B, NVFP4, TP=2)**|
+
+_注：结果为单个请求的解码速度（输入 4k，输出 1k，`Hopper` 80G）。_
   </details>
 
 ### 演示视频
@@ -104,7 +109,7 @@ export PATH=$PATH:/usr/local/cuda/bin/
 ```shell
 # sm+70/sm_75硬件平台需要去除“flashattn,flashinfer,cutlass”特性
 # 将 `flashinfer` 替换为 `flashattn` 则启用Flash attention后端
-cargo install --features cuda,nccl,graph,flashinfer,cutlass --path .
+cargo install --features cuda,nccl,flashinfer,cutlass --path .
 ```
 
 适用于多节点推理
@@ -114,7 +119,7 @@ sudo apt install clang libclang-dev
 cargo install --features cuda,nccl,flashattn,cutlass,mpi --path . #同时包含flash attention与MPI功能
 
 # FlashInfer 后端
-cargo install --features cuda,nccl,graph,flashinfer,cutlass,mpi --path .
+cargo install --features cuda,nccl,flashinfer,cutlass,mpi --path .
 ```
 
 **Mac/Metal平台**
@@ -135,22 +140,22 @@ cargo install --features metal --path .
     **示例:**
 
     ```shell
-    [RUST_LOG=warn] cargo run [--release --features cuda,nccl,flashinfer,cutlass,graph] -- [--log --dtype bf16 --p 2000 --d 0,1 --gpu-memory-fraction 0.7 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1 --enforce-parser qwen_coder --yarn-scaling-factor 4.0] [--m Qwen/Qwen3.5-27B-FP8] [--fp8-kvcache] [--ui-server]
+    [RUST_LOG=warn] cargo run [--release --features cuda,nccl,flashinfer,cutlass] -- [--log --dtype bf16 --p 2000 --d 0,1 --gpu-memory-fraction 0.5 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1 --enforce-parser qwen_coder --yarn-scaling-factor 4.0] [--m Qwen/Qwen3.6-27B-FP8] [--kvcache-dtype fp8] [--ui-server]
     ```
 
     `ENV_PARAM`: RUST_LOG=warn
 
-    `BUILD_PARAM`: --release --features cuda,nccl,flashinfer,cutlass,graph
+    `BUILD_PARAM`: --release --features cuda,nccl,flashinfer,cutlass
 
-    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --gpu-memory-fraction 0.7 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1 --enforce-parser qwen_coder --yarn-scaling-factor 4.0
+    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --gpu-memory-fraction 0.5 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1 --enforce-parser qwen_coder --yarn-scaling-factor 4.0
 
-    `MODEL_ID/MODEL_WEIGHT_PATH`: --m Qwen/Qwen3.5-27B-FP8（或使用 `--w` 指定本地模型路径）
+    `MODEL_ID/MODEL_WEIGHT_PATH`: --m Qwen/Qwen3.6-27B-FP8（或使用 `--w` 指定本地模型路径）
 
-    `CACHE CONFIG`: --fp8-kvcache
+    `CACHE CONFIG`: --kvcache-dtype auto/fp8/turbo8/turbo4/turbo3
 
     `WEB UI`: --ui-server
 
-    其中，`--p`: 服务端口; `--d`: 设备序列号; `--w`: 权重路径 (safetensors路径); `--f`: 权重文件 (GGUF模型使用); `--m`: Huggingface model-id; `--isq`将权重在加载过程中量化为`q4k`格式；`--prefill-chunk-size`指定分块prefill时的块大小（默认8K，`0`为禁用），`--frequency-penalty`和`--presence-penalty`为重复输出惩罚项 (取值-2.0到2.0)；`--mem` (`kvcache-mem-gpu`) 用于以 MB 为单位设置固定 KV Cache 预算；`--gpu-memory-fraction` 会在模型加载完成后按 `fraction * 总显存 - 当前占用显存` 自动计算 KV Cache 大小；`--enforce-parser` 用于强制指定 tool calling 解析器后端，例如 `qwen_coder`、`qwen`、`json` 或 `mistral`；`--yarn-scaling-factor` 用于手动注入 YaRN RoPE 缩放因子，例如 `4.0`，以在支持的模型上扩展有效上下文长度；`--fp8-kvcache` 参数用于启用 FP8 KV Cache；`--prefix-cache` 启用前缀缓存复用；`--prefix-cache-max-tokens` 限制前缀缓存大小；`--ui-server` 启动内置 Web UI。若要使用 Flash attention 后端，可将示例中的 `flashinfer` 替换为 `flashattn`。
+    其中，`--p`: 服务端口; `--d`: 设备序列号; `--w`: 权重路径 (safetensors路径); `--f`: 权重文件 (GGUF模型使用); `--m`: Huggingface model-id; `--isq`将权重在加载过程中量化为`q4k`格式；`--prefill-chunk-size`指定分块prefill时的块大小（默认8K，`0`为禁用），`--frequency-penalty`和`--presence-penalty`为重复输出惩罚项 (取值-2.0到2.0)；`--mem` (`kvcache-mem-gpu`) 用于以 MB 为单位设置固定 KV Cache 预算；`--gpu-memory-fraction` 会在模型加载完成后按 `fraction * 总显存 - 当前占用显存` 自动计算 KV Cache 大小；`--enforce-parser` 用于强制指定 tool calling 解析器后端，例如 `qwen_coder`、`qwen`、`json` 或 `mistral`；`--yarn-scaling-factor` 用于手动注入 YaRN RoPE 缩放因子，例如 `4.0`，以在支持的模型上扩展有效上下文长度；`--kvcache-dtype` 设置 KV Cache 量化模式（`auto`/`fp8`/`turbo8`/`turbo4`/`turbo3`）；`--disable-prefix-cache` 禁用前缀缓存（默认开启）；`--prefix-cache-max-tokens` 限制前缀缓存大小；`--disable-cuda-graph` 禁用 CUDA Graph 捕获（CUDA 构建默认开启）；`--ui-server` 启动内置 Web UI。若要使用 Flash attention 后端，可将示例中的 `flashinfer` 替换为 `flashattn`。
   </details>
 
 ## 📚 文档
@@ -160,8 +165,9 @@ cargo install --features metal --path .
 - [Tool Calling解析](docs/tool_parsing.md)
 - [Prefix Cache](docs/prefix_cache.md)
 - [多模态模型使用](docs/multimodal.md)
-- [OpenCode + Candle-vLLM后端](docs/opencode.md)
-- [Kilo Code + Candle-vLLM后端](docs/kilocode.md)
+- [在xbot 中使用 Candle-vLLM后端](docs/xbot.md)
+- [在OpenCode 中使用 Candle-vLLM后端](docs/opencode.md)
+- [在Kilo Code 中使用 Candle-vLLM后端](docs/kilocode.md)
 
 ## 如何运行模型？
 
@@ -181,33 +187,64 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
 
     **本地路径 (ISQ量化, +UI Server)**
     ```shell
-    candle-vllm --p 8000 --d 0,1 --w /home/Qwen3.5-27B/ --isq q4k --ui-server --prefix-cache
+    candle-vllm --p 8000 --d 0,1 --w /home/Qwen3.6-27B/ --isq q4k --ui-server
     ```
 
     **模型ID（从Huggingface下载）**
 
     ```shell
-    candle-vllm --m Qwen/Qwen3.5-35B-A3B --ui-server --prefix-cache
+    candle-vllm --m Qwen/Qwen3.6-35B-A3B --ui-server
     ```
 
     **手动设置 YaRN 缩放**
     ```shell
-    candle-vllm --m Qwen/Qwen3.5-35B-A3B --yarn-scaling-factor 4.0 --ui-server --prefix-cache
+    candle-vllm --m Qwen/Qwen3.6-35B-A3B --yarn-scaling-factor 4.0 --ui-server
     ```
 
     **FP8 模型** (block-wise量化, 通过增加`cutlass`特性构建)
     ```shell
-    candle-vllm --m Qwen/Qwen3.5-27B-FP8 --ui-server --prefix-cache
+    candle-vllm --m Qwen/Qwen3.6-27B-FP8 --ui-server
     ```
     **FP4 模型** (MXFP4/NVFP4, 暂不支持MLX量化格式)
     ```shell
-    candle-vllm --m GadflyII-GLM-4.7-Flash-NVFP4 --ui-server --prefix-cache
+    candle-vllm --m GadflyII-GLM-4.7-Flash-NVFP4 --ui-server
     ```
 
     ```shell
-    candle-vllm --m nm-testing/Qwen3-30B-A3B-MXFP4A16 --ui-server --prefix-cache
+    candle-vllm --m nm-testing/Qwen3-30B-A3B-MXFP4A16 --ui-server
     ```
   </details>
+
+- FP8 KV Cache
+  <details>
+    <summary>显示详情</summary>
+    ```shell
+    cargo run --release --features cuda,nccl,flashinfer,cutlass -- --w /data/Qwen3.5-35B-A3B-FP8/ --d 0 --p 2000 --kvcache-dtype fp8
+    ```
+  </details>
+
+- **TurboQuant KV Cache**（4-bit/3-bit 量化 KV 缓存，使用原生 Flash 注意力内核）
+
+    TurboQuant 通过 Walsh-Hadamard 变换压缩 KV 缓存，实现更高吞吐量和更长上下文：
+
+    | 模式 | 描述 | KV 缓存压缩比 | 推荐用途 |
+    |------|------|--------------|---------|
+    | `turbo8` | FP8 K + 4-bit V | ~2.6x | 最佳质量-压缩比平衡 |
+    | `turbo4` | 4-bit K + 4-bit V | ~3.7x | 质量与显存节省兼顾 |
+    | `turbo3` | 3-bit K + 4-bit V | ~4.7x | 最大限度节省显存 |
+
+    ```shell
+    # Turbo4（4-bit KV 缓存，约3.7倍压缩）
+    candle-vllm --w /data/Qwen3.5-27B-FP8/ --kvcache-dtype turbo4
+
+    # Turbo8（FP8 K + 4-bit V，约2.6倍压缩）
+    candle-vllm --w /data/Qwen3.5-27B-FP8/ --kvcache-dtype turbo8
+
+    # Turbo3（3-bit K + 4-bit V，约4.7倍压缩）
+    candle-vllm --w /data/Qwen3.5-27B-FP8/ --kvcache-dtype turbo3
+    ```
+
+    > **注意**：TurboQuant 使用原生 Flash 注意力内核（flashinfer 自动禁用）。支持 CUDA（SM70+）和 Metal（Apple Silicon）两种平台。MLA 模型（DeepSeek、GLM4）因 KV 压缩布局不兼容会自动回退到标准 KV 缓存。
 
 - 运行**GGUF**模型 
   <details open>
@@ -252,7 +289,7 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
     **只需在运行未量化模型时添加`isq`参数**
 
     ```shell
-    candle-vllm --m Qwen/Qwen3.5-27B --isq q4k
+    candle-vllm --m Qwen/Qwen3.6-27B --isq q4k
     ```
 
     注：原位量化加载可能需要更长的加载时间，原位`isq`参数选项：["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2k", "q3k","q4k","q5k","q6k"]
@@ -650,7 +687,7 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
     <summary>显示详情</summary>
     `--mem` (`kvcache-mem-gpu`) 用于以 MB 为单位设置固定 KV Cache 预算，默认值为 `4096` MB。
 
-    `--gpu-memory-fraction` 提供一个更轻量的自动模式。不显式指定时，默认值为 `0.7`。模型加载完成后，candle-vllm 会探测每张已加载的 CUDA 或 Metal 设备，并按以下公式计算 KV Cache 预算：
+    `--gpu-memory-fraction` 提供一个更轻量的自动模式。不显式指定时，默认值为 `0.5`。模型加载完成后，candle-vllm 会探测每张已加载的 CUDA 或 Metal 设备，并按以下公式计算 KV Cache 预算：
 
     ```
     gpu_memory_fraction * total_gpu_memory - current_memory_usage
@@ -659,7 +696,7 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
     多卡场景下，会取所有 rank 中最小的结果作为每个 rank 的 KV Cache 预算。例如：
 
     ```
-    candle-vllm --w /home/Qwen3-Coder-30B-A3B-Instruct-FP8 --d 0,1 --gpu-memory-fraction 0.7
+    candle-vllm --w /home/Qwen3-Coder-30B-A3B-Instruct-FP8 --d 0,1 --gpu-memory-fraction 0.5
     ```
 
     当你需要显式固定缓存预算时，用 `--mem`。当你希望服务根据模型加载后的可用显存自动调整时，用 `--gpu-memory-fraction`。
@@ -692,6 +729,7 @@ docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data cand
 
     其中`isq`可选值为：["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2k", "q3k","q4k","q5k","q6k", "awq", "gptq", "marlin", "gguf", "ggml"]。
   </details>
+
 
 - **GPTQ/AWQ模型通过Marlin Kernel加速**
   <details>

@@ -11,10 +11,12 @@ use super::OpenAIServerData;
 use crate::openai::lora::{LoadAdapterRequest, RegisterAdapterRequest, UnloadAdapterRequest};
 use crate::openai::multimodal::{build_messages_and_images, ImageData};
 use crate::openai::{resolve_tools_for_request, ResolvedToolConfig};
+use crate::tools::helpers::{
+    build_invalid_tool_call_feedback, build_tool_schema_map, filter_tool_calls,
+};
 use crate::tools::stream_parser::{
     detect_prefilled_reasoning_end_marker, extract_reasoning_content,
 };
-use crate::tools::ToolFormat;
 use axum::response::sse::KeepAlive;
 use axum::{
     extract::{Json, Path, State},
@@ -31,12 +33,16 @@ use tokio::time::Duration;
 use tracing::debug;
 use uuid::Uuid;
 
+const REQUEST_ADMISSION_DECODE_BUDGET_TOKENS: usize = 4096;
+
 fn current_model_name(data: &OpenAIServerData) -> Result<String, APIError> {
     let model = data.model.read();
-    let (pipeline, _) = model
-        .get_pipeline(0)
-        .ok_or(APIError::new("Missing pipeline".to_string()))?;
-    Ok(pipeline.name().to_string())
+    let model_name = model.model_name();
+    if model_name.is_empty() {
+        Err(APIError::new("Missing pipeline".to_string()))
+    } else {
+        Ok(model_name.to_string())
+    }
 }
 
 fn resolve_response_model_name(requested: Option<&str>, current: &str) -> String {
@@ -52,11 +58,10 @@ async fn get_gen_prompt(
     request: &ChatCompletionRequest,
     tool_config: &ResolvedToolConfig,
 ) -> Result<(String, Option<ImageData>), APIError> {
-    let mut model = data.model.write();
-    let pipeline = model
-        .get_mut_pipeline(0)
-        .ok_or(APIError::new("Missing pipeline".to_string()))?;
-    let mut conversation = pipeline.0.get_conversation().clone();
+    let model = data.model.read();
+    let mut conversation = model.conversation();
+    let image_config = model.image_config();
+    drop(model);
     let mut image_data = None;
 
     match &request.messages {
@@ -65,7 +70,7 @@ async fn get_gen_prompt(
         }
         Messages::Chat(messages) => {
             let (render_messages, images) =
-                build_messages_and_images(messages, pipeline.0.image_config.as_ref())
+                build_messages_and_images(messages, image_config.as_ref())
                     .map_err(APIError::from)?;
             image_data = images;
             for message in render_messages {
@@ -106,31 +111,6 @@ async fn get_gen_prompt(
         }
     }
 
-    if !tool_config.tools.is_empty() {
-        let mut tools_prompt = ToolFormat::get_tool_prompt(
-            &pipeline.0.tool_config,
-            &pipeline.0.tool_model_type,
-            &pipeline.0.tool_parser_model_id,
-            pipeline.0.enforce_parser.as_deref(),
-        );
-
-        // Enforce tool_choice=function by prepending a mandatory instruction
-        if let crate::openai::ToolChoiceKind::Function(name) = &tool_config.choice {
-            tools_prompt = format!(
-                "IMPORTANT: You MUST call the tool \"{}\". Do not respond with plain text.\n\n{}",
-                name, tools_prompt
-            );
-        }
-
-        let current_system = conversation.get_system_message().unwrap_or_default();
-        let new_system = if current_system.is_empty() {
-            tools_prompt
-        } else {
-            format!("{}\n\n{}", current_system, tools_prompt)
-        };
-        conversation.set_system_message(Some(new_system));
-    }
-
     let enable_thinking = request.thinking.unwrap_or(true);
     let prompt = conversation.get_prompt(enable_thinking, &tool_config.tools);
 
@@ -141,23 +121,15 @@ async fn check_length(
     request: &ChatCompletionRequest,
     prompt: String,
     data: &OpenAIServerData,
-) -> Result<(Vec<u32>, usize), APIError> {
-    let (token_ids, available_kv_tokens) = {
+) -> Result<Vec<u32>, APIError> {
+    let token_ids = {
         let model = data.model.read();
-        let available_kv_tokens = model.get_available_kv_tokens();
-        let pipeline = model
-            .get_pipeline(0)
-            .ok_or(APIError::new("Missing pipeline".to_string()))?;
-        (
-            pipeline
-                .0
-                .tokenizer()
-                .encode_fast(prompt, true)
-                .map_err(APIError::from)?
-                .get_ids()
-                .to_vec(),
-            available_kv_tokens,
-        )
+        model
+            .tokenizer()
+            .encode_fast(prompt, true)
+            .map_err(APIError::from)?
+            .get_ids()
+            .to_vec()
     };
 
     let max_gen_tokens = request
@@ -175,18 +147,8 @@ async fn check_length(
             token_ids.len(),
             max_gen_tokens
         )))
-    } else if token_ids.len() >= available_kv_tokens {
-        Err(APIError::new(format!(
-            "Requested prompt({} tokens) is  \
-            larger than available kvcache (maximum {} tokens).\n \
-            You can increase kvcache by setting `--mem` to a larger value!",
-            token_ids.len(),
-            available_kv_tokens
-        )))
     } else {
-        let max_valid_request_tokens =
-            std::cmp::min(available_kv_tokens, data.pipeline_config.max_model_len) - 10;
-        Ok((token_ids, max_valid_request_tokens))
+        Ok(token_ids)
     }
 }
 
@@ -345,11 +307,10 @@ pub async fn chat_completions(
         Err(e) => return ChatResponder::ValidationError(e),
     };
 
-    let (token_ids, available_tokens): (Vec<u32>, usize) =
-        match check_length(&request, prompt.clone(), &data).await {
-            Ok(ids) => ids,
-            Err(e) => return ChatResponder::ValidationError(e),
-        };
+    let token_ids = match check_length(&request, prompt.clone(), &data).await {
+        Ok(ids) => ids,
+        Err(e) => return ChatResponder::ValidationError(e),
+    };
 
     debug!("\n\n\nPrompt {:?}", prompt);
     if let Some(ref l) = logger {
@@ -362,26 +323,116 @@ pub async fn chat_completions(
         .max_tokens
         .unwrap_or(data.pipeline_config.default_max_tokens);
 
-    if max_request_tokens + token_ids.len() > available_tokens {
+    let max_model_decode_tokens = data
+        .pipeline_config
+        .max_model_len
+        .saturating_sub(token_ids.len())
+        .saturating_sub(10);
+    if max_request_tokens > max_model_decode_tokens {
         tracing::warn!(
-            "Requested max tokens + prompt length {} larger than available tokens {}, \
-        max_tokens changed to {} ({} tokens reserved for prompt)!",
-            max_request_tokens + token_ids.len(),
-            available_tokens,
-            available_tokens - token_ids.len(),
-            token_ids.len()
+            "Requested max_tokens {} exceeds remaining model context {}, max_tokens changed to {}.",
+            max_request_tokens,
+            max_model_decode_tokens,
+            max_model_decode_tokens
         );
-        max_request_tokens = if available_tokens > token_ids.len() {
-            available_tokens - token_ids.len()
-        } else {
+        max_request_tokens = max_model_decode_tokens;
+    }
+    if max_request_tokens == 0 {
+        return ChatResponder::ValidationError(APIError::new(format!(
+            "Requested prompt({} tokens) leaves no room for generated tokens within maximum model context {}.",
+            token_ids.len(),
+            data.pipeline_config.max_model_len
+        )));
+    }
+
+    // Query prefix cache to determine how many prompt tokens are already cached
+    let mut cached_tokens = {
+        let mut model = data.model.write();
+        model.query_prefix_cache_match_tokens(&token_ids)
+    };
+    let mut new_tokens = token_ids.len().saturating_sub(cached_tokens);
+    let minimum_decode_budget_tokens =
+        max_request_tokens.min(REQUEST_ADMISSION_DECODE_BUDGET_TOKENS);
+    let mut target_required_tokens = new_tokens.saturating_add(max_request_tokens);
+    let mut minimum_required_tokens = new_tokens.saturating_add(minimum_decode_budget_tokens);
+
+    let mut available_tokens = {
+        let mut model = data.model.write();
+        let (available_tokens, evicted) = model.ensure_available_kv_tokens(target_required_tokens);
+        if evicted > 0 {
+            tracing::warn!(
+                "Evicted {} prefix cache block(s) to reserve {} KV tokens for request admission ({} new prompt + {} requested decode).",
+                evicted,
+                target_required_tokens,
+                new_tokens,
+                max_request_tokens
+            );
+        }
+        available_tokens
+    };
+    loop {
+        let refreshed_cached_tokens = {
+            let mut model = data.model.write();
+            model.query_prefix_cache_match_tokens(&token_ids)
+        };
+        if refreshed_cached_tokens == cached_tokens {
+            break;
+        }
+
+        cached_tokens = refreshed_cached_tokens;
+        new_tokens = token_ids.len().saturating_sub(cached_tokens);
+        target_required_tokens = new_tokens.saturating_add(max_request_tokens);
+        minimum_required_tokens = new_tokens.saturating_add(minimum_decode_budget_tokens);
+        let (refreshed_available_tokens, evicted) = {
+            let mut model = data.model.write();
+            model.ensure_available_kv_tokens(target_required_tokens)
+        };
+        if evicted > 0 {
+            tracing::warn!(
+                "Evicted {} additional prefix cache block(s) after prefix-cache hit changed; reserving {} KV tokens ({} new prompt + {} requested decode).",
+                evicted,
+                target_required_tokens,
+                new_tokens,
+                max_request_tokens
+            );
+        }
+        available_tokens = refreshed_available_tokens;
+        if evicted == 0 {
+            break;
+        }
+    }
+
+    if minimum_required_tokens > available_tokens {
+        if available_tokens <= new_tokens {
             return ChatResponder::ValidationError(APIError::new(format!(
-                "Requested prompt({} tokens) is  \
+                "Requested prompt({} tokens, {} new after prefix cache) is  \
                 larger than available kvcache (maximum {} tokens).\n \
-                You can increase kvcache by setting `--mem` to a larger value!",
+                You can increase kvcache by setting `--gpu-memory-fraction` (default 0.5) to a larger value!",
                 token_ids.len(),
+                new_tokens,
                 available_tokens
             )));
         }
+        return ChatResponder::ValidationError(APIError::new(format!(
+            "Requested prompt({} tokens, {} new after prefix cache) plus {} decode budget tokens is \
+            larger than available kvcache (maximum {} tokens).\n \
+            You can increase kvcache by setting `--gpu-memory-fraction` (default 0.5) to a larger value!",
+            token_ids.len(),
+            new_tokens,
+            minimum_decode_budget_tokens,
+            available_tokens
+        )));
+    }
+
+    if target_required_tokens > available_tokens {
+        tracing::warn!(
+            "Request admitted with {} KV tokens available, below requested reservation {} tokens but enough for {} new prompt tokens plus {} decode budget tokens ({} cached prompt tokens).",
+            available_tokens,
+            target_required_tokens,
+            new_tokens,
+            minimum_decode_budget_tokens,
+            cached_tokens
+        );
     }
 
     let generation_cfg = data.pipeline_config.generation_cfg.as_ref().unwrap();
@@ -441,6 +492,8 @@ pub async fn chat_completions(
     };
     let adapter_id_for_engine = adapter_id.clone();
     let adapter_schedule_for_engine = adapter_schedule.clone();
+    let request_tools_for_engine = tool_config.tools.clone();
+    let response_tools = tool_config.tools.clone();
 
     let _ = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(async move {
@@ -455,7 +508,7 @@ pub async fn chat_completions(
                     false,
                     EncodingFormat::default(),
                     EmbeddingType::default(),
-                    tool_config.tools.clone(),
+                    request_tools_for_engine.clone(),
                     image_data,
                     if stream_request {
                         Some(Arc::new(response_tx))
@@ -516,7 +569,7 @@ pub async fn chat_completions(
         // blocks are preserved even when tool calls consume the remaining
         // content.  Without this, tool parsing sets content=None and the
         // subsequent reasoning extraction finds nothing.
-        if crate::stream_as_reasoning_content() && has_tools {
+        if crate::stream_as_reasoning_content() {
             for choice in &mut final_choices {
                 if let Some(text) = choice.message.content.take() {
                     match extract_reasoning_content(&text) {
@@ -538,18 +591,40 @@ pub async fn chat_completions(
 
         if has_tools {
             let parser = crate::tools::parser::ToolParser::new();
+            let tool_schemas = build_tool_schema_map(&response_tools);
             for choice in &mut final_choices {
-                if choice.message.tool_calls.is_some() {
+                let parsed_calls = if let Some(calls) = choice.message.tool_calls.take() {
+                    calls
+                } else if let Some(content) = &choice.message.content {
+                    parser.parse(content)
+                } else {
+                    Vec::new()
+                };
+
+                if parsed_calls.is_empty() {
                     continue;
                 }
-                if let Some(content) = &choice.message.content {
-                    let calls = parser.parse(content);
-                    if !calls.is_empty() {
-                        choice.message.tool_calls = Some(calls);
-                        choice.message.content = None;
-                        choice.finish_reason = Some("tool_calls".to_string());
-                    }
+
+                let (valid_calls, invalid_calls) = filter_tool_calls(&parsed_calls, &tool_schemas);
+                if !invalid_calls.is_empty() {
+                    tracing::warn!(
+                        "Dropped {} invalid tool call(s) before response",
+                        invalid_calls.len()
+                    );
                 }
+                if valid_calls.is_empty() {
+                    if let Some(feedback) =
+                        build_invalid_tool_call_feedback(&invalid_calls, &tool_schemas, None)
+                    {
+                        choice.message.content = Some(feedback);
+                    }
+                    choice.finish_reason = Some("stop".to_string());
+                    continue;
+                }
+
+                choice.message.tool_calls = Some(valid_calls);
+                choice.message.content = None;
+                choice.finish_reason = Some("tool_calls".to_string());
             }
         }
 
@@ -592,20 +667,24 @@ pub async fn create_embeddings(
     let prompt_str = prompts[0].clone();
 
     //TODO: Reuse check_length or similar logic. For now simplified.
-    let (token_ids, available_tokens) = {
+    let token_ids = {
         let model = data.model.read();
-        let available_kv_tokens = model.get_available_kv_tokens();
-        let pipeline = model
-            .get_pipeline(0)
-            .ok_or(APIError::new("Missing pipeline".to_string()));
-
-        match pipeline {
-            Ok(pipeline) => match pipeline.0.tokenizer().encode_fast(prompt_str, true) {
-                Ok(encoding) => (encoding.get_ids().to_vec(), available_kv_tokens),
-                Err(e) => return ChatResponder::ValidationError(APIError::from(e)),
-            },
-            Err(e) => return ChatResponder::ModelError(e),
+        match model.tokenizer().encode_fast(prompt_str, true) {
+            Ok(encoding) => encoding.get_ids().to_vec(),
+            Err(e) => return ChatResponder::ValidationError(APIError::from(e)),
         }
+    };
+
+    let available_tokens = {
+        let mut model = data.model.write();
+        let (available_tokens, evicted) = model.ensure_available_kv_tokens(token_ids.len());
+        if evicted > 0 {
+            tracing::warn!(
+                "Evicted {} prefix cache block(s) before embedding length check.",
+                evicted
+            );
+        }
+        available_tokens
     };
 
     if token_ids.len() >= available_tokens {

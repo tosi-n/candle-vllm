@@ -24,12 +24,11 @@ use crate::openai::responses::{APIError, ChatCompletionResponse};
 use crate::openai::runtime_internal::{RuntimeInternalService, RuntimeKvProfile};
 use crate::openai::sampling_params::{EarlyStoppingCondition, GenerationConfig, SamplingParams};
 use crate::openai::streaming::ChatResponse;
-use crate::openai::{resolve_tools_for_request, OpenAIServerData, PipelineConfig, ToolChoiceKind};
+use crate::openai::{resolve_tools_for_request, OpenAIServerData, PipelineConfig};
 use crate::scheduler::cache_engine::CacheEngine;
 use crate::scheduler::prefix_cache::PrefixCacheConfig;
 use crate::scheduler::sequence::{InteractiveSessionControl, InteractiveSessionEvent};
 use crate::scheduler::SchedulerConfig;
-use crate::tools::ToolFormat;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedRuntimeConfig {
@@ -269,29 +268,6 @@ async fn build_prompt(
         }
     }
 
-    if !tool_config.tools.is_empty() {
-        let mut tools_prompt = ToolFormat::get_tool_prompt(
-            &pipeline.0.tool_config,
-            &pipeline.0.tool_model_type,
-            &pipeline.0.tool_parser_model_id,
-            pipeline.0.enforce_parser.as_deref(),
-        );
-        if let ToolChoiceKind::Function(name) = &tool_config.choice {
-            tools_prompt = format!(
-                "IMPORTANT: You MUST call the tool \"{}\". Do not respond with plain text.\n\n{}",
-                name, tools_prompt
-            );
-        }
-
-        let current_system = conversation.get_system_message().unwrap_or_default();
-        let new_system = if current_system.is_empty() {
-            tools_prompt
-        } else {
-            format!("{}\n\n{}", current_system, tools_prompt)
-        };
-        conversation.set_system_message(Some(new_system));
-    }
-
     Ok(conversation.get_prompt(request.thinking.unwrap_or(false), &tool_config.tools))
 }
 
@@ -361,7 +337,16 @@ impl EmbeddedCandleVllmHost {
             loader.prepare_model_weights(config.hf_token.clone(), config.hf_token_path.clone())?;
 
         let dtype = crate::get_dtype(config.dtype.clone());
-        let kv_cache_dtype = if config.fp8_kvcache { DType::U8 } else { dtype };
+        let kvcache_dtype_enum = if config.fp8_kvcache {
+            crate::openai::models::KvCacheDtype::Fp8
+        } else {
+            crate::openai::models::KvCacheDtype::Auto
+        };
+        let kv_cache_dtype = if kvcache_dtype_enum.is_fp8_keys() {
+            DType::U8
+        } else {
+            dtype
+        };
         let device_ids = if config.device_ids.is_empty() {
             vec![0usize]
         } else {
@@ -435,6 +420,7 @@ impl EmbeddedCandleVllmHost {
                 num_shards,
                 config.max_num_seqs.max(16),
                 config.prefix_cache,
+                None,
             )?;
 
         let mut runtime_model_config = None;
@@ -450,6 +436,7 @@ impl EmbeddedCandleVllmHost {
                     &cfg,
                     kv_cache_dtype,
                     num_shards,
+                    kvcache_dtype_enum,
                 );
                 local_cache_cfg.mamba_cache_budget_bytes = mamba_cache_budget_bytes;
                 let cache_engine = CacheEngine::new(
@@ -496,6 +483,7 @@ impl EmbeddedCandleVllmHost {
             SchedulerConfig {
                 max_num_seqs: config.max_num_seqs,
                 prefix_cache: prefix_cache_config,
+                mamba_cache_capacity: None,
             },
             &cache_config,
             &model_config,
@@ -506,6 +494,7 @@ impl EmbeddedCandleVllmHost {
             #[cfg(feature = "nccl")]
             None,
             config.prefill_chunk_size,
+            false,
         )?;
 
         if config.generation_cfg.is_some() || pipeline_config.generation_cfg.is_none() {
@@ -710,7 +699,6 @@ impl EmbeddedCandleVllmHost {
                 max_seqlen_q: prompt_len,
                 max_seqlen_k: prompt_len,
                 max_context_len: 0,
-                disable_flash_attn: None,
                 seqlens: Some(vec![prompt_len as u32]),
                 flashinfer_metadata: None,
             };

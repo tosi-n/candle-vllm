@@ -29,6 +29,7 @@ use crate::{
             glm4_moe_lite::GLM4MoeLiteForCausalLM,
             llama::Llama,
             llama4::LLama4ForConditionalGeneration,
+            minimax::MiniMaxForCausalLM,
             mistral::Mistral,
             mistral3_vl::Mistral3ForConditionalGeneration,
             phi2::Phi2,
@@ -87,6 +88,7 @@ pub enum LLMModel {
     Gemma3(Arc<Gemma3>),
     Gemma3VL(Arc<Gemma3ForConditionalGeneration>),
     Gemma4(Arc<Gemma4>),
+    MiniMax(Arc<MiniMaxForCausalLM>),
     Mistral(Arc<Mistral>),
     Mistral3VL(Arc<Mistral3ForConditionalGeneration>),
     Yi(Arc<Yi>),
@@ -105,7 +107,8 @@ pub enum LLMModel {
 
 fn tool_model_type_for(model: &LLMModel) -> ToolModelType {
     match model {
-        LLMModel::Llama(_) | LLMModel::LLaMa4(_) | LLMModel::LlamaGGUF(_) => ToolModelType::LLaMa,
+        LLMModel::Llama(_) | LLMModel::LlamaGGUF(_) => ToolModelType::LLaMa,
+        LLMModel::LLaMa4(_) => ToolModelType::LLaMa4,
         LLMModel::Qwen(_)
         | LLMModel::Qwen3_5(_)
         | LLMModel::Qwen3VL(_)
@@ -116,7 +119,9 @@ fn tool_model_type_for(model: &LLMModel) -> ToolModelType {
         | LLMModel::QWenGGUFMoE(_)
         | LLMModel::QWen3_5GGUFMoE(_) => ToolModelType::Qwen3MoE,
         LLMModel::Gemma(_) => ToolModelType::Gemma,
-        LLMModel::Gemma3(_) | LLMModel::Gemma3VL(_) | LLMModel::Gemma4(_) => ToolModelType::Gemma3,
+        LLMModel::Gemma3(_) | LLMModel::Gemma3VL(_) => ToolModelType::Gemma3,
+        LLMModel::Gemma4(_) => ToolModelType::Gemma4,
+        LLMModel::MiniMax(_) => ToolModelType::MiniMax,
         LLMModel::Mistral(_) | LLMModel::Mistral3VL(_) => ToolModelType::Mistral,
         LLMModel::Yi(_) => ToolModelType::Yi,
         LLMModel::StableLM(_) => ToolModelType::StableLM,
@@ -573,6 +578,7 @@ impl DefaultLoader {
         #[cfg(not(feature = "nccl"))]
         let pipeline_num_shards = local_world_size.unwrap_or(device_ids.len());
         let _guard = candle_core::InferenceMode::enter();
+        attention_rs::reset_paged_attention_layer_counter();
         let (models, devices, config, sep_style) = if gguf {
             let device = crate::new_device(device_ids[0]).unwrap();
             let path = paths.get_weight_filenames()[0].clone();
@@ -883,6 +889,7 @@ impl DefaultLoader {
                 "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" | "DeepseekV32ForCausalLM" => {
                     DeepSeek::load_config(&cfile, isq.clone())?
                 }
+                "MiniMaxM2ForCausalLM" => MiniMaxForCausalLM::load_config(&cfile, isq.clone())?,
                 _ => panic!("Model not supported!"),
             };
             if !matches!(
@@ -892,10 +899,26 @@ impl DefaultLoader {
                     | "DeepseekV32ForCausalLM"
                     | "Glm4MoeLiteForCausalLM"
                     | "Llama4ForConditionalGeneration"
+                    | "MiniMaxM2ForCausalLM"
             ) {
                 config.apply_runtime_rope_overrides(self.yarn_scaling_factor);
             }
-            config.fp8_kvcache = Some(kv_cache_dtype == DType::U8);
+            let global_kvcache = crate::openai::models::KvCacheDtype::get_global();
+            if global_kvcache != crate::openai::models::KvCacheDtype::Auto {
+                if global_kvcache.is_turboquant()
+                    && !cfg!(feature = "cuda")
+                    && !cfg!(feature = "metal")
+                {
+                    tracing::warn!(
+                        "TurboQuant ({:?}) requires CUDA or Metal, ignoring on this platform.",
+                        global_kvcache
+                    );
+                } else {
+                    config.kvcache_dtype = global_kvcache;
+                }
+            } else if kv_cache_dtype == DType::U8 {
+                config.kvcache_dtype = crate::openai::models::KvCacheDtype::Fp8;
+            }
 
             if let Some(qcfg) = &mut config.quantization_config {
                 qcfg.normalize_compressed_tensors();
@@ -1274,6 +1297,25 @@ impl DefaultLoader {
                             )),
                             SeparatorStyle::Llama3,
                         ),
+                        "MiniMaxM2ForCausalLM" => (
+                            LLMModel::MiniMax(Arc::new(
+                                MiniMaxForCausalLM::new(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .map_err(|e| {
+                                    candle_core::Error::msg(format!(
+                                        "Failed to load MiniMax model for arch {} on rank {}: {}",
+                                        arch, rank, e
+                                    ))
+                                })?,
+                            )),
+                            SeparatorStyle::Qwen,
+                        ),
                         _ => panic!("Model not supported!"),
                     };
 
@@ -1614,6 +1656,7 @@ impl DefaultPipeline {
             Gemma,
             Gemma3,
             Gemma4,
+            MiniMax,
             Mistral,
             Yi,
             StableLM,
@@ -1629,7 +1672,18 @@ impl DefaultPipeline {
             GLM4GGUF,
         );
         #[cfg(all(feature = "cuda", feature = "graph", feature = "flashinfer"))]
-        let flashinfer_kv_params = if _kv_cache_dtype == DType::U8 {
+        let skip_flashinfer = config.kvcache_dtype.is_turboquant()
+            || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
+            || config.gemma4_per_layer_cache_config().is_some();
+
+        #[cfg(all(feature = "cuda", feature = "graph", feature = "flashinfer"))]
+        let flashinfer_kv_params = if skip_flashinfer {
+            if config.kvcache_dtype.is_turboquant() {
+                tracing::info!(
+                    "Use native flash backend ({:?} kvcache, flashinfer disabled)",
+                    config.kvcache_dtype
+                );
+            }
             None
         } else if config.is_mla() {
             Some(FlashInferKvParams {
@@ -1750,8 +1804,7 @@ impl DefaultPipeline {
         #[cfg(all(feature = "cuda", feature = "graph"))]
         if !input_metadata.is_prefill {
             let input_batch = input_tokens.dim(0)?;
-            let require_exact_graph = input_metadata.mamba_slot_mapping.is_some()
-                || input_metadata.flashinfer_metadata.is_some();
+            let require_exact_graph = input_metadata.mamba_slot_mapping.is_some();
             let can_replay = if require_exact_graph {
                 self.capturer.is_exact_captured(input_batch)
             } else {
@@ -1843,6 +1896,9 @@ impl DefaultPipeline {
             LLMModel::Gemma4(gemma4) => {
                 gemma4.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
+            LLMModel::MiniMax(m) => {
+                m.forward(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
             LLMModel::Mistral(mistral) => {
                 mistral.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
@@ -1905,6 +1961,9 @@ impl DefaultPipeline {
                 llama.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
             }
             LLMModel::LLaMa4(m) => {
+                m.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::MiniMax(m) => {
                 m.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
             }
             LLMModel::Mistral(mistral) => {
@@ -2168,7 +2227,9 @@ impl DefaultPipeline {
                         seq.deref_mut().deref_mut().pending_finish_logprobs = Some(finish_logprobs);
                         return Right("tool_calls".to_string());
                     }
-                    if self.json_end_token_id == Some(next_token) {
+                    if self.tool_call_end_token_ids.is_empty()
+                        && self.json_end_token_id == Some(next_token)
+                    {
                         let mut output_tokens: Vec<u32> = seq
                             .deref()
                             .get_output_tokens()
@@ -2236,6 +2297,7 @@ impl DefaultPipeline {
             LLMModel::Gemma3(gemma3) => gemma3.get_config().clone(),
             LLMModel::Gemma3VL(gemma3) => gemma3.get_config().clone(),
             LLMModel::Gemma4(gemma4) => gemma4.get_config().clone(),
+            LLMModel::MiniMax(m) => m.get_config().clone(),
             LLMModel::Mistral(mistral) => mistral.get_config().clone(),
             LLMModel::Mistral3VL(mistral) => mistral.get_config().clone(),
             LLMModel::Yi(yi) => yi.get_config().clone(),
@@ -2334,6 +2396,12 @@ impl DefaultPipeline {
             LLMModel::QWen3_5GGUFMoE(model) => model.set_mamba_prefix_cache_capacity(capacity),
             _ => {}
         }
+    }
+
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    pub fn clamp_mamba_graph_capture_batches(&mut self, mamba_slot_capacity: usize) {
+        self.capturer
+            .clamp_mamba_graph_batch_size(mamba_slot_capacity);
     }
 
     pub fn capture_mamba_prefix_state(
